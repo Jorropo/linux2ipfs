@@ -10,13 +10,15 @@ import (
 	"golang.org/x/sys/unix"
 
 	cid "github.com/ipfs/go-cid"
+	cbor "github.com/ipfs/go-ipld-cbor"
+	car "github.com/ipld/go-car"
 	mh "github.com/multiformats/go-multihash"
 )
 
 const blockTarget = 1024 * 1024 // 1 Mib
-const carMaxSize = 1024 * 1024 * 1024 * 32
+const carMaxSize = 32 * 1024 * 1024 * 1024
 const inlineLimit = 40
-const tempFileName = "out.car"
+const tempFileName = ".temp.car"
 
 var rawleafCIDLength int
 var dagCborCIDLength int
@@ -53,16 +55,74 @@ func mainRet() int {
 	err = tempCarConn.Control(func(tempCarFd uintptr) {
 		controlR = func(tempCarFd int) int {
 			r := &recursiveTraverser{
-				tempCarFd:   tempCarFd,
-				fileOffset:  carMaxSize,
-				tempCarFile: tempCar,
+				tempCarFd:     tempCarFd,
+				tempCarOffset: carMaxSize,
+				tempCarFile:   tempCar,
 			}
 
 			c, err := r.do(os.Args[1])
 			if err != nil {
-				fmt.Println(err.Error())
+				fmt.Println("error doing: " + err.Error())
 				return 1
 			}
+			var outSize int64
+			out, err := os.OpenFile(os.Args[2], os.O_CREATE|os.O_WRONLY, 0o600)
+			if err != nil {
+				fmt.Println("error opening out file: " + err.Error())
+				return 1
+			}
+
+			// Writing CAR header
+			{
+				headerBuffer, err := cbor.DumpObject(&car.CarHeader{
+					Roots:   []cid.Cid{c},
+					Version: 1,
+				})
+				if err != nil {
+					fmt.Println("error serialising header: " + err.Error())
+					return 1
+				}
+
+				varuintHeader := make([]byte, binary.MaxVarintLen64)
+				uvarintSize := binary.PutUvarint(varuintHeader, uint64(len(headerBuffer)))
+				outSize += int64(uvarintSize)
+				err = fullWrite(out, varuintHeader[:uvarintSize])
+				if err != nil {
+					fmt.Println("error writing out header varuint: " + err.Error())
+					return 1
+				}
+
+				outSize += int64(len(headerBuffer))
+				err = fullWrite(out, headerBuffer)
+				if err != nil {
+					fmt.Println("error writing out header: " + err.Error())
+					return 1
+				}
+			}
+
+			// copying tempCar to out
+			err = tempCar.Sync()
+			if err != nil {
+				fmt.Println("error syncing temp file: " + err.Error())
+				return 1
+			}
+			_, err = tempCar.Seek(r.tempCarOffset, 0)
+			if err != nil {
+				fmt.Println("error seeking temp file: " + err.Error())
+				return 1
+			}
+			_, err = io.Copy(out, tempCar)
+			if err != nil {
+				fmt.Println("error copying to out file: " + err.Error())
+				return 1
+			}
+			outSize += carMaxSize - r.tempCarOffset
+			err = out.Truncate(outSize)
+			if err != nil {
+				fmt.Println("error truncating out file: " + err.Error())
+				return 1
+			}
+
 			fmt.Println(c.String())
 
 			return 0
@@ -77,9 +137,9 @@ func mainRet() int {
 }
 
 type recursiveTraverser struct {
-	fileOffset  int64
-	tempCarFile *os.File
-	tempCarFd   int
+	tempCarOffset int64
+	tempCarFile   *os.File
+	tempCarFd     int
 }
 
 func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
@@ -132,8 +192,8 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 				continue
 			}
 
-			varuintHeader := make([]byte, binary.MaxVarintLen64)
-			uvarintSize := binary.PutUvarint(varuintHeader, uint64(workSize))
+			varuintHeader := make([]byte, binary.MaxVarintLen64+rawleafCIDLength)
+			uvarintSize := binary.PutUvarint(varuintHeader, uint64(rawleafCIDLength)+uint64(workSize))
 			varuintHeader = varuintHeader[:uvarintSize]
 
 			blockHeaderSize := uvarintSize + rawleafCIDLength
@@ -153,6 +213,9 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 				return cid.Cid{}, fmt.Errorf("error encoding multihash for %s: %e", task, err)
 			}
 			c := cid.NewCidV1(cid.Raw, mhash)
+			leavesCIDs[i] = c
+
+			r.tempCarFile.WriteAt(append(varuintHeader, c.Bytes()...), carOffset)
 
 			fsc, err := f.SyscallConn()
 			if err != nil {
@@ -161,7 +224,7 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 			var errr error
 			err = fsc.Control(func(rfd uintptr) {
 				carBlockTarget := carOffset + int64(blockHeaderSize)
-				_, err := unix.CopyFileRange(int(rfd), &fileOffset, int(r.tempCarFd), &carBlockTarget, int(workSize), 0)
+				_, err := unix.CopyFileRange(int(rfd), &fileOffset, r.tempCarFd, &carBlockTarget, int(workSize), 0)
 				if err != nil {
 					errr = fmt.Errorf("error zero-copying for %s: %e", task, err)
 					return
@@ -174,7 +237,6 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 			if errr != nil {
 				return cid.Cid{}, errr
 			}
-			leavesCIDs[i] = c
 		}
 
 		if len(leavesCIDs) == 1 {
@@ -186,8 +248,22 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 }
 
 func (r *recursiveTraverser) takeOffset(size int64) (int64, error) {
-	if r.fileOffset < size {
-		return 0, fmt.Errorf("Asked for %d bytes while %d are available.", size, r.fileOffset)
+	if r.tempCarOffset < size {
+		return 0, fmt.Errorf("Asked for %d bytes while %d are available.", size, r.tempCarOffset)
 	}
-	return r.fileOffset - size, nil
+	r.tempCarOffset -= size
+	return r.tempCarOffset, nil
+}
+
+func fullWrite(w io.Writer, buff []byte) error {
+	toWrite := len(buff)
+	var written int
+	for toWrite != written {
+		n, err := w.Write(buff[written:])
+		if err != nil {
+			return err
+		}
+		written += n
+	}
+	return nil
 }
