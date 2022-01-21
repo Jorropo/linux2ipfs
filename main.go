@@ -9,19 +9,22 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	pb "github.com/Jorropo/linux2ipfs/pb"
+	proto "google.golang.org/protobuf/proto"
+
 	cid "github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	car "github.com/ipld/go-car"
 	mh "github.com/multiformats/go-multihash"
 )
 
-const blockTarget = 1024 * 1024 // 1 Mib
-const carMaxSize = 32 * 1024 * 1024 * 1024
+const blockTarget = 1024 * 1024            // 1 MiB
+const carMaxSize = 32 * 1024 * 1024 * 1024 // 32 GiB
 const inlineLimit = 40
 const tempFileName = ".temp.car"
 
 var rawleafCIDLength int
-var dagCborCIDLength int
+var dagPBCIDLength int
 
 func init() {
 	h, err := mh.Encode(make([]byte, 32), mh.SHA2_256)
@@ -29,7 +32,7 @@ func init() {
 		panic(err)
 	}
 	rawleafCIDLength = len(cid.NewCidV1(cid.Raw, h).Bytes())
-	dagCborCIDLength = len(cid.NewCidV1(cid.DagCBOR, h).Bytes())
+	dagPBCIDLength = len(cid.NewCidV1(cid.DagProtobuf, h).Bytes())
 }
 
 func main() {
@@ -75,7 +78,7 @@ func mainRet() int {
 			// Writing CAR header
 			{
 				headerBuffer, err := cbor.DumpObject(&car.CarHeader{
-					Roots:   []cid.Cid{c},
+					Roots:   []cid.Cid{c.Cid},
 					Version: 1,
 				})
 				if err != nil {
@@ -91,6 +94,8 @@ func mainRet() int {
 					fmt.Println("error writing out header varuint: " + err.Error())
 					return 1
 				}
+
+				fmt.Printf("cbor length: %d\n", len(headerBuffer))
 
 				outSize += int64(len(headerBuffer))
 				err = fullWrite(out, headerBuffer)
@@ -123,7 +128,7 @@ func mainRet() int {
 				return 1
 			}
 
-			fmt.Println(c.String())
+			fmt.Println(c.Cid.String())
 
 			return 0
 		}(int(tempCarFd))
@@ -142,10 +147,15 @@ type recursiveTraverser struct {
 	tempCarFd     int
 }
 
-func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
+type cidSizePair struct {
+	Cid  cid.Cid
+	Size int64
+}
+
+func (r *recursiveTraverser) do(task string) (cidSizePair, error) {
 	info, err := os.Lstat(task)
 	if err != nil {
-		return cid.Cid{}, fmt.Errorf("error stating %s: %e\n", task, err)
+		return cidSizePair{}, fmt.Errorf("error stating %s: %e\n", task, err)
 	}
 	switch info.Mode() & os.ModeType {
 	case os.ModeDir:
@@ -156,22 +166,23 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 		// File
 		f, err := os.Open(task)
 		if err != nil {
-			return cid.Cid{}, fmt.Errorf("failed to open %s: %e", task, err)
+			return cidSizePair{}, fmt.Errorf("failed to open %s: %e", task, err)
 		}
 		defer f.Close()
 
 		var fileOffset int64
 
 		size := info.Size()
-		i := (size-1)/blockTarget + 1
-		leavesCIDs := make([]cid.Cid, i)
-		if i != 1 {
-			panic("TODO: Support multiple blocks files")
+		var blockCount int64
+		if size == 0 {
+			blockCount = 1
+		} else {
+			blockCount = (size-1)/blockTarget + 1
 		}
 		sizeLeft := size
+		CIDs := make([]cidSizePair, blockCount)
 
-		for i != 0 {
-			i--
+		for i := int64(0); i != blockCount; i++ {
 			workSize := sizeLeft
 			if workSize > blockTarget {
 				workSize = blockTarget
@@ -182,13 +193,14 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 				data := make([]byte, workSize)
 				_, err := io.ReadFull(f, data)
 				if err != nil {
-					return cid.Cid{}, fmt.Errorf("error reading %s: %e", task, err)
+					return cidSizePair{}, fmt.Errorf("error reading %s: %e", task, err)
 				}
 				hash, err := mh.Encode(data, mh.IDENTITY)
 				if err != nil {
-					return cid.Cid{}, fmt.Errorf("error inlining %s: %e", task, err)
+					return cidSizePair{}, fmt.Errorf("error inlining %s: %e", task, err)
 				}
-				leavesCIDs[i] = cid.NewCidV1(cid.Raw, hash)
+				CIDs[i].Cid = cid.NewCidV1(cid.Raw, hash)
+				CIDs[i].Size = workSize
 				continue
 			}
 
@@ -200,31 +212,37 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 
 			carOffset, err := r.takeOffset(int64(blockHeaderSize) + workSize)
 			if err != nil {
-				return cid.Cid{}, err
+				return cidSizePair{}, err
 			}
 
 			hash := sha256.New()
 			_, err = io.CopyN(hash, f, workSize)
 			if err != nil {
-				return cid.Cid{}, fmt.Errorf("error hashing %s: %e", task, err)
+				return cidSizePair{}, fmt.Errorf("error hashing %s: %e", task, err)
 			}
 			mhash, err := mh.Encode(hash.Sum(nil), mh.SHA2_256)
 			if err != nil {
-				return cid.Cid{}, fmt.Errorf("error encoding multihash for %s: %e", task, err)
+				return cidSizePair{}, fmt.Errorf("error encoding multihash for %s: %e", task, err)
 			}
 			c := cid.NewCidV1(cid.Raw, mhash)
-			leavesCIDs[i] = c
+			CIDs[i].Cid = c
+			CIDs[i].Size = workSize
 
-			r.tempCarFile.WriteAt(append(varuintHeader, c.Bytes()...), carOffset)
+			err = fullWriteAt(r.tempCarFile, append(varuintHeader, c.Bytes()...), carOffset)
+			if err != nil {
+				return cidSizePair{}, fmt.Errorf("error writing CID + header: %e", err)
+			}
 
 			fsc, err := f.SyscallConn()
 			if err != nil {
-				return cid.Cid{}, fmt.Errorf("error openning SyscallConn for %s: %e", task, err)
+				return cidSizePair{}, fmt.Errorf("error openning SyscallConn for %s: %e", task, err)
 			}
 			var errr error
 			err = fsc.Control(func(rfd uintptr) {
+				// CopyFileRange updates the offset pointers, so let's not clobber them
 				carBlockTarget := carOffset + int64(blockHeaderSize)
-				_, err := unix.CopyFileRange(int(rfd), &fileOffset, r.tempCarFd, &carBlockTarget, int(workSize), 0)
+				tempFileOffset := fileOffset
+				_, err := unix.CopyFileRange(int(rfd), &tempFileOffset, r.tempCarFd, &carBlockTarget, int(workSize), 0)
 				if err != nil {
 					errr = fmt.Errorf("error zero-copying for %s: %e", task, err)
 					return
@@ -232,18 +250,82 @@ func (r *recursiveTraverser) do(task string) (cid.Cid, error) {
 				fileOffset += workSize
 			})
 			if err != nil {
-				return cid.Cid{}, fmt.Errorf("error controling for %s: %e", task, err)
+				return cidSizePair{}, fmt.Errorf("error controling for %s: %e", task, err)
 			}
 			if errr != nil {
-				return cid.Cid{}, errr
+				return cidSizePair{}, errr
 			}
 		}
 
-		if len(leavesCIDs) == 1 {
-			return leavesCIDs[0], nil
+		if len(CIDs) == 0 {
+			panic("Internal bug!")
 		}
 
-		panic("TODO: support linked many blocks of one file")
+		for _, v := range CIDs {
+			fmt.Println(v.Cid.String())
+		}
+
+		for len(CIDs) != 1 {
+			// Generate roots
+			var newRoots []cidSizePair
+			for len(CIDs) != 0 {
+				if len(CIDs) == 1 {
+					// Don't create roots that links to one block, just forward that block
+					newRoots = append(newRoots, CIDs...)
+					break
+				}
+
+				var CIDCountAttempt int = 2
+				var size int64 = CIDs[0].Size + CIDs[1].Size
+				lastRoot, err := makeFileRoot(CIDs[:CIDCountAttempt])
+				if err != nil {
+					return cidSizePair{}, fmt.Errorf("error building a root for %s: %e", task, err)
+				}
+				for len(lastRoot) < blockTarget && len(CIDs) > CIDCountAttempt {
+					size += CIDs[CIDCountAttempt].Size
+					CIDCountAttempt++
+					newRoot, err := makeFileRoot(CIDs[:CIDCountAttempt])
+					if err != nil {
+						return cidSizePair{}, fmt.Errorf("error building a root for %s: %e", task, err)
+					}
+					if len(newRoot) > blockTarget {
+						CIDCountAttempt--
+						size -= CIDs[CIDCountAttempt].Size
+						break
+					}
+					lastRoot = newRoot
+				}
+				CIDs = CIDs[CIDCountAttempt:]
+
+				// Making block header
+				varuintHeader := make([]byte, binary.MaxVarintLen64+dagPBCIDLength+len(lastRoot))
+				uvarintSize := binary.PutUvarint(varuintHeader, uint64(dagPBCIDLength)+uint64(len(lastRoot)))
+				varuintHeader = varuintHeader[:uvarintSize]
+
+				fullSize := len(lastRoot) + uvarintSize + dagPBCIDLength
+
+				h := sha256.Sum256(lastRoot)
+				mhash, err := mh.Encode(h[:], mh.SHA2_256)
+				if err != nil {
+					return cidSizePair{}, fmt.Errorf("error encoding multihash for %s root: %e", task, err)
+				}
+				c := cid.NewCidV1(cid.DagProtobuf, mhash)
+				rootBlock := append(append(varuintHeader, c.Bytes()...), lastRoot...)
+				newRoots = append(newRoots, cidSizePair{c, size})
+
+				off, err := r.takeOffset(int64(fullSize))
+				if err != nil {
+					return cidSizePair{}, fmt.Errorf("error taking offset for %s root: %e", task, err)
+				}
+				err = fullWriteAt(r.tempCarFile, rootBlock, off)
+				if err != nil {
+					return cidSizePair{}, fmt.Errorf("error writing %s root's header: %e", task, err)
+				}
+			}
+			CIDs = newRoots
+		}
+
+		return CIDs[0], nil
 	}
 }
 
@@ -266,4 +348,52 @@ func fullWrite(w io.Writer, buff []byte) error {
 		written += n
 	}
 	return nil
+}
+
+func fullWriteAt(w io.WriterAt, buff []byte, off int64) error {
+	toWrite := int64(len(buff))
+	var written int64
+	for toWrite != written {
+		n, err := w.WriteAt(buff[written:], off+written)
+		if err != nil {
+			return err
+		}
+		written += int64(n)
+	}
+	return nil
+}
+
+func makeFileRoot(ins []cidSizePair) ([]byte, error) {
+	links := make([]*pb.PBLink, len(ins))
+	sizes := make([]uint64, len(ins))
+	var sum uint64
+	for i, v := range ins {
+		s := uint64(v.Size)
+		links[i] = &pb.PBLink{
+			Hash:  v.Cid.Bytes(),
+			Tsize: &s,
+		}
+		sizes[i] = s
+		sum += s
+	}
+
+	typ := pb.UnixfsData_File
+
+	unixfs := pb.UnixfsData{
+		Filesize:   &sum,
+		Blocksizes: sizes,
+		Type:       &typ,
+	}
+
+	unixfsBlob, err := proto.Marshal(&unixfs)
+	if err != nil {
+		return nil, err
+	}
+
+	node := pb.PBNode{
+		Links: links,
+		Data:  unixfsBlob,
+	}
+
+	return proto.Marshal(&node)
 }
