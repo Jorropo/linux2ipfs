@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"strconv"
 
 	"golang.org/x/sys/unix"
 
@@ -22,6 +25,8 @@ const blockTarget = 1024 * 1024                      // 1 MiB
 const carMaxSize = 32*1024*1024*1024 - 1024*1024*128 // ~32 GiB
 const inlineLimit = 32
 const tempFileNamePattern = ".temp.%s.car"
+const envKeyKey = "ESTUARY_KEY"
+const envShuttleKey = "ESTUARY_SHUTTLE"
 
 var rawleafCIDLength int
 var dagPBCIDLength int
@@ -85,12 +90,14 @@ func mainRet() int {
 			err = tempCarBConn.Control(func(tempCarBFd uintptr) {
 				controlR = func(tempCarBFd int) int {
 					r := &recursiveTraverser{
-						tempCarChunk:  swapAbleFile{tempCarA, tempCarAFd},
-						tempCarSend:   swapAbleFile{tempCarB, tempCarBFd},
-						tempCarOffset: carMaxSize,
-						chunkT:        make(chan struct{}, 1),
-						sendT:         make(chan sendJobs, 1),
-						sendOver:      make(chan struct{}),
+						tempCarChunk:   swapAbleFile{tempCarA, tempCarAFd},
+						tempCarSend:    swapAbleFile{tempCarB, tempCarBFd},
+						tempCarOffset:  carMaxSize,
+						chunkT:         make(chan struct{}, 1),
+						sendT:          make(chan sendJobs, 1),
+						sendOver:       make(chan struct{}),
+						estuaryKey:     os.Getenv(envKeyKey),
+						estuaryShuttle: "https://" + os.Getenv(envShuttleKey) + "/content/add-car",
 					}
 					r.chunkT <- struct{}{}
 					go r.sendWorker()
@@ -148,46 +155,75 @@ func (r *recursiveTraverser) sendWorker() {
 }
 
 func (r *recursiveTraverser) send(job sendJobs) error {
-	if job.offset == carMaxSize {
+	if job.offset == carMaxSize || len(job.roots) == 0 {
 		// Empty car do nothing.
 		return nil
 	}
 
-	var outSize int64
-	out, err := os.OpenFile(fmt.Sprintf(os.Args[2], r.sendCounter), os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("opening out file: %e", err)
-	}
-	r.sendCounter++
+	// Write a linking root if we have multiple roots
+	var data []byte
+	var root cid.Cid
+	if len(job.roots) != 1 {
+		var err error
+		links := make([]*pb.PBLink, len(job.roots))
 
+		for i, v := range job.roots {
+			sSize := uint64(v.DagSize)
+			n := strconv.FormatUint(uint64(i), 32)
+			links[i] = &pb.PBLink{
+				Name:  &n,
+				Tsize: &sSize,
+				Hash:  v.Cid.Bytes(),
+			}
+		}
+
+		data, err = proto.Marshal(&pb.PBNode{
+			Links: links,
+			Data:  directoryData,
+		})
+		if err != nil {
+			return fmt.Errorf("can't Marshal rooting directory: %e", err)
+		}
+		if len(data) > blockTarget {
+			return fmt.Errorf("rooting directory exceed block limit, TODO: support sharding directories")
+		}
+
+		// Making block header
+		varuintHeader := make([]byte, binary.MaxVarintLen64+dagPBCIDLength+len(data))
+		uvarintSize := binary.PutUvarint(varuintHeader, uint64(dagPBCIDLength)+uint64(len(data)))
+		varuintHeader = varuintHeader[:uvarintSize]
+
+		h := sha256.Sum256(data)
+		mhash, err := mh.Encode(h[:], mh.SHA2_256)
+		if err != nil {
+			return fmt.Errorf("encoding multihash: %e", err)
+		}
+		c := cid.NewCidV1(cid.DagProtobuf, mhash)
+		data = append(append(varuintHeader, c.Bytes()...), data...)
+		root = c
+	} else {
+		root = job.roots[0].Cid
+	}
+
+	var buff io.Reader
 	// Writing CAR header
 	{
 		headerBuffer, err := cbor.DumpObject(&car.CarHeader{
-			Roots:   job.roots,
+			Roots:   []cid.Cid{root},
 			Version: 1,
 		})
 		if err != nil {
 			return fmt.Errorf("serialising header: %e", err)
 		}
 
-		varuintHeader := make([]byte, binary.MaxVarintLen64)
+		varuintHeader := make([]byte, binary.MaxVarintLen64+uint64(len(headerBuffer))+uint64(len(data)))
 		uvarintSize := binary.PutUvarint(varuintHeader, uint64(len(headerBuffer)))
-		outSize += int64(uvarintSize)
-		err = fullWrite(out, varuintHeader[:uvarintSize])
-		if err != nil {
-			return fmt.Errorf("writing out header varuint: %e", err)
-		}
-
-		outSize += int64(len(headerBuffer))
-		err = fullWrite(out, headerBuffer)
-		if err != nil {
-			return fmt.Errorf("writing out header: %e", err)
-		}
+		buff = bytes.NewBuffer(append(append(varuintHeader[:uvarintSize], headerBuffer...), data...))
 	}
 
 	// copying tempCar to out
 	tempCar := r.tempCarSend.File
-	err = tempCar.Sync()
+	err := tempCar.Sync()
 	if err != nil {
 		return fmt.Errorf("syncing temp file: %e", err)
 	}
@@ -195,14 +231,22 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 	if err != nil {
 		return fmt.Errorf("seeking temp file: %e", err)
 	}
-	_, err = io.Copy(out, tempCar)
+	req, err := http.NewRequest("POST", r.estuaryShuttle, io.MultiReader(buff, tempCar))
 	if err != nil {
-		return fmt.Errorf("copying to out file: %e", err)
+		return fmt.Errorf("creating the request failed: %e", err)
 	}
-	outSize += carMaxSize - job.offset
-	err = out.Truncate(outSize)
+
+	req.Header.Set("Content-Type", "application/car")
+	req.Header.Set("Authorization", "Bearer "+r.estuaryKey)
+
+	resp, err := r.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("truncating out file: %e", err)
+		return fmt.Errorf("posting failed: %e", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("non 200 result code: %d / body: %s", resp.StatusCode, string(b))
 	}
 
 	return nil
@@ -242,7 +286,7 @@ type swapAbleFile struct {
 }
 
 type sendJobs struct {
-	roots  []cid.Cid
+	roots  []*cidSizePair
 	offset int64
 }
 
@@ -255,10 +299,13 @@ type recursiveTraverser struct {
 	sendT    chan sendJobs
 	sendOver chan struct{}
 
-	sendCounter uint
+	estuaryKey     string
+	estuaryShuttle string
 
 	rootsLen uint
 	roots    *cidRootsNode
+
+	client http.Client
 }
 
 type cidRootsNode struct {
@@ -305,12 +352,12 @@ func (rt *recursiveTraverser) removeRoot(c *cidSizePair) {
 }
 
 func (r *recursiveTraverser) pullRoots() sendJobs {
-	cids := make([]cid.Cid, r.rootsLen)
+	cids := make([]*cidSizePair, r.rootsLen)
 	var i uint
 	cur := r.roots
 	for cur != nil {
 		o := cur.c
-		cids[i] = o.Cid
+		cids[i] = o
 		o.rootNode = nil
 		cur = cur.next
 		i++
