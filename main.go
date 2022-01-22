@@ -288,7 +288,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (cidSizePair, er
 				}
 				CIDs[i].Cid = cid.NewCidV1(cid.Raw, hash)
 				CIDs[i].FileSize = workSize
-				CIDs[i].DagSize = 0
+				CIDs[i].DagSize = workSize
 				continue
 			}
 
