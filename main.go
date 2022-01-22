@@ -51,7 +51,7 @@ func main() {
 func mainRet() int {
 	tempCar, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		fmt.Println("error openning tempCar: " + err.Error())
+		fmt.Fprintln(os.Stderr, "error openning tempCar: "+err.Error())
 		return 1
 	}
 	defer os.Remove(tempFileName)
@@ -59,7 +59,7 @@ func mainRet() int {
 
 	tempCarConn, err := tempCar.SyscallConn()
 	if err != nil {
-		fmt.Println("error getting SyscallConn for tempCar: " + err.Error())
+		fmt.Fprintln(os.Stderr, "error getting SyscallConn for tempCar: "+err.Error())
 		return 1
 	}
 
@@ -74,13 +74,13 @@ func mainRet() int {
 
 			c, err := r.do(os.Args[1], nil)
 			if err != nil {
-				fmt.Println("error doing: " + err.Error())
+				fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
 				return 1
 			}
 			var outSize int64
 			out, err := os.OpenFile(os.Args[2], os.O_CREATE|os.O_WRONLY, 0o600)
 			if err != nil {
-				fmt.Println("error opening out file: " + err.Error())
+				fmt.Fprintln(os.Stderr, "error opening out file: "+err.Error())
 				return 1
 			}
 
@@ -91,7 +91,7 @@ func mainRet() int {
 					Version: 1,
 				})
 				if err != nil {
-					fmt.Println("error serialising header: " + err.Error())
+					fmt.Fprintln(os.Stderr, "error serialising header: "+err.Error())
 					return 1
 				}
 
@@ -100,14 +100,14 @@ func mainRet() int {
 				outSize += int64(uvarintSize)
 				err = fullWrite(out, varuintHeader[:uvarintSize])
 				if err != nil {
-					fmt.Println("error writing out header varuint: " + err.Error())
+					fmt.Fprintln(os.Stderr, "error writing out header varuint: "+err.Error())
 					return 1
 				}
 
 				outSize += int64(len(headerBuffer))
 				err = fullWrite(out, headerBuffer)
 				if err != nil {
-					fmt.Println("error writing out header: " + err.Error())
+					fmt.Fprintln(os.Stderr, "error writing out header: "+err.Error())
 					return 1
 				}
 			}
@@ -115,33 +115,33 @@ func mainRet() int {
 			// copying tempCar to out
 			err = tempCar.Sync()
 			if err != nil {
-				fmt.Println("error syncing temp file: " + err.Error())
+				fmt.Fprintln(os.Stderr, "error syncing temp file: "+err.Error())
 				return 1
 			}
 			_, err = tempCar.Seek(r.tempCarOffset, 0)
 			if err != nil {
-				fmt.Println("error seeking temp file: " + err.Error())
+				fmt.Fprintln(os.Stderr, "error seeking temp file: "+err.Error())
 				return 1
 			}
 			_, err = io.Copy(out, tempCar)
 			if err != nil {
-				fmt.Println("error copying to out file: " + err.Error())
+				fmt.Fprintln(os.Stderr, "error copying to out file: "+err.Error())
 				return 1
 			}
 			outSize += carMaxSize - r.tempCarOffset
 			err = out.Truncate(outSize)
 			if err != nil {
-				fmt.Println("error truncating out file: " + err.Error())
+				fmt.Fprintln(os.Stderr, "error truncating out file: "+err.Error())
 				return 1
 			}
 
-			fmt.Println(c.Cid.String())
+			fmt.Fprintln(os.Stderr, c.Cid.String())
 
 			return 0
 		}(int(tempCarFd))
 	})
 	if err != nil {
-		fmt.Println("error getting FD for tempCar: " + err.Error())
+		fmt.Fprintln(os.Stderr, "error getting FD for tempCar: "+err.Error())
 		return 1
 	}
 
