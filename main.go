@@ -25,6 +25,7 @@ const tempFileName = ".temp.car"
 
 var rawleafCIDLength int
 var dagPBCIDLength int
+var directoryData []byte
 
 func init() {
 	h, err := mh.Encode(make([]byte, 32), mh.SHA2_256)
@@ -33,6 +34,14 @@ func init() {
 	}
 	rawleafCIDLength = len(cid.NewCidV1(cid.Raw, h).Bytes())
 	dagPBCIDLength = len(cid.NewCidV1(cid.DagProtobuf, h).Bytes())
+
+	typ := pb.UnixfsData_Directory
+	directoryData, err = proto.Marshal(&pb.UnixfsData{
+		Type: &typ,
+	})
+	if err != nil {
+		panic(err)
+	}
 }
 
 func main() {
@@ -63,7 +72,7 @@ func mainRet() int {
 				tempCarFile:   tempCar,
 			}
 
-			c, err := r.do(os.Args[1])
+			c, err := r.do(os.Args[1], nil)
 			if err != nil {
 				fmt.Println("error doing: " + err.Error())
 				return 1
@@ -141,6 +150,34 @@ func mainRet() int {
 	return controlR
 }
 
+func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
+	// Making block header
+	varuintHeader := make([]byte, binary.MaxVarintLen64+dagPBCIDLength+len(data))
+	uvarintSize := binary.PutUvarint(varuintHeader, uint64(dagPBCIDLength)+uint64(len(data)))
+	varuintHeader = varuintHeader[:uvarintSize]
+
+	fullSize := len(data) + uvarintSize + dagPBCIDLength
+
+	h := sha256.Sum256(data)
+	mhash, err := mh.Encode(h[:], mh.SHA2_256)
+	if err != nil {
+		return cid.Cid{}, fmt.Errorf("error encoding multihash: %e", err)
+	}
+	c := cid.NewCidV1(cid.DagProtobuf, mhash)
+	rootBlock := append(append(varuintHeader, c.Bytes()...), data...)
+
+	off, err := r.takeOffset(int64(fullSize))
+	if err != nil {
+		return cid.Cid{}, fmt.Errorf("error taking offset: %e", err)
+	}
+	err = fullWriteAt(r.tempCarFile, rootBlock, off)
+	if err != nil {
+		return cid.Cid{}, fmt.Errorf("error writing root's header: %e", err)
+	}
+
+	return c, nil
+}
+
 type recursiveTraverser struct {
 	tempCarOffset int64
 	tempCarFile   *os.File
@@ -148,18 +185,70 @@ type recursiveTraverser struct {
 }
 
 type cidSizePair struct {
-	Cid  cid.Cid
-	Size int64
+	Cid      cid.Cid
+	FileSize int64
+	DagSize  int64
 }
 
-func (r *recursiveTraverser) do(task string) (cidSizePair, error) {
-	info, err := os.Lstat(task)
-	if err != nil {
-		return cidSizePair{}, fmt.Errorf("error stating %s: %e\n", task, err)
+func (r *recursiveTraverser) do(task string, entry os.FileInfo) (cidSizePair, error) {
+	var err error
+	if entry == nil {
+		entry, err = os.Lstat(task)
+		if err != nil {
+			return cidSizePair{}, fmt.Errorf("error stating %s: %e\n", task, err)
+		}
 	}
-	switch info.Mode() & os.ModeType {
+	switch entry.Mode() & os.ModeType {
 	case os.ModeDir:
-		panic("TODO")
+		subThings, err := os.ReadDir(task)
+		if err != nil {
+			return cidSizePair{}, fmt.Errorf("error ReadDir %s: %e\n", task, err)
+		}
+
+		links := make([]*pb.PBLink, len(subThings))
+
+		var fileSum int64
+		var dagSum int64
+		for i, v := range subThings {
+			sInfo, err := v.Info()
+			if err != nil {
+				return cidSizePair{}, fmt.Errorf("error getting info of %s/%s: %e", task, v.Name(), err)
+			}
+			sCid, err := r.do(task+"/"+v.Name(), sInfo)
+			if err != nil {
+				return cidSizePair{}, err
+			}
+
+			fileSum += sCid.FileSize
+			dagSum += sCid.DagSize
+			sSize := uint64(sCid.DagSize)
+			n := v.Name()
+			links[i] = &pb.PBLink{
+				Name:  &n,
+				Tsize: &sSize,
+				Hash:  sCid.Cid.Bytes(),
+			}
+		}
+
+		data, err := proto.Marshal(&pb.PBNode{
+			Links: links,
+			Data:  directoryData,
+		})
+		if err != nil {
+			return cidSizePair{}, fmt.Errorf("can't Marshal directory %s: %e", task, err)
+		}
+		if len(data) > blockTarget {
+			return cidSizePair{}, fmt.Errorf("%s is exceed block limit, TODO: support sharding directories", task)
+		}
+
+		dagSum += int64(len(data))
+
+		c, err := r.writePBNode(data)
+		if err != nil {
+			return cidSizePair{}, fmt.Errorf("error writing directory %s: %e", task, err)
+		}
+
+		return cidSizePair{c, fileSum, dagSum}, nil
 	case os.ModeSymlink:
 		panic("TODO")
 	default:
@@ -172,7 +261,7 @@ func (r *recursiveTraverser) do(task string) (cidSizePair, error) {
 
 		var fileOffset int64
 
-		size := info.Size()
+		size := entry.Size()
 		var blockCount int64
 		if size == 0 {
 			blockCount = 1
@@ -200,7 +289,8 @@ func (r *recursiveTraverser) do(task string) (cidSizePair, error) {
 					return cidSizePair{}, fmt.Errorf("error inlining %s: %e", task, err)
 				}
 				CIDs[i].Cid = cid.NewCidV1(cid.Raw, hash)
-				CIDs[i].Size = workSize
+				CIDs[i].FileSize = workSize
+				CIDs[i].DagSize = 0
 				continue
 			}
 
@@ -226,7 +316,8 @@ func (r *recursiveTraverser) do(task string) (cidSizePair, error) {
 			}
 			c := cid.NewCidV1(cid.Raw, mhash)
 			CIDs[i].Cid = c
-			CIDs[i].Size = workSize
+			CIDs[i].FileSize = workSize
+			CIDs[i].DagSize = workSize
 
 			err = fullWriteAt(r.tempCarFile, append(varuintHeader, c.Bytes()...), carOffset)
 			if err != nil {
@@ -274,51 +365,35 @@ func (r *recursiveTraverser) do(task string) (cidSizePair, error) {
 				}
 
 				var CIDCountAttempt int = 2
-				var size int64 = CIDs[0].Size + CIDs[1].Size
-				lastRoot, err := makeFileRoot(CIDs[:CIDCountAttempt])
+				var fileSum int64 = int64(CIDs[0].FileSize) + int64(CIDs[1].FileSize)
+				var dagSum int64 = int64(CIDs[0].DagSize) + int64(CIDs[1].DagSize)
+				lastRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
 				if err != nil {
 					return cidSizePair{}, fmt.Errorf("error building a root for %s: %e", task, err)
 				}
 				for len(lastRoot) < blockTarget && len(CIDs) > CIDCountAttempt {
-					size += CIDs[CIDCountAttempt].Size
+					fileSum += CIDs[CIDCountAttempt].FileSize
 					CIDCountAttempt++
-					newRoot, err := makeFileRoot(CIDs[:CIDCountAttempt])
+					newRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
 					if err != nil {
 						return cidSizePair{}, fmt.Errorf("error building a root for %s: %e", task, err)
 					}
 					if len(newRoot) > blockTarget {
 						CIDCountAttempt--
-						size -= CIDs[CIDCountAttempt].Size
+						fileSum -= CIDs[CIDCountAttempt].FileSize
 						break
 					}
 					lastRoot = newRoot
 				}
 				CIDs = CIDs[CIDCountAttempt:]
 
-				// Making block header
-				varuintHeader := make([]byte, binary.MaxVarintLen64+dagPBCIDLength+len(lastRoot))
-				uvarintSize := binary.PutUvarint(varuintHeader, uint64(dagPBCIDLength)+uint64(len(lastRoot)))
-				varuintHeader = varuintHeader[:uvarintSize]
+				dagSum += int64(len(lastRoot))
 
-				fullSize := len(lastRoot) + uvarintSize + dagPBCIDLength
-
-				h := sha256.Sum256(lastRoot)
-				mhash, err := mh.Encode(h[:], mh.SHA2_256)
+				c, err := r.writePBNode(lastRoot)
 				if err != nil {
-					return cidSizePair{}, fmt.Errorf("error encoding multihash for %s root: %e", task, err)
+					return cidSizePair{}, fmt.Errorf("error writing root for %s: %e", task, err)
 				}
-				c := cid.NewCidV1(cid.DagProtobuf, mhash)
-				rootBlock := append(append(varuintHeader, c.Bytes()...), lastRoot...)
-				newRoots = append(newRoots, cidSizePair{c, size})
-
-				off, err := r.takeOffset(int64(fullSize))
-				if err != nil {
-					return cidSizePair{}, fmt.Errorf("error taking offset for %s root: %e", task, err)
-				}
-				err = fullWriteAt(r.tempCarFile, rootBlock, off)
-				if err != nil {
-					return cidSizePair{}, fmt.Errorf("error writing %s root's header: %e", task, err)
-				}
+				newRoots = append(newRoots, cidSizePair{c, fileSum, dagSum})
 			}
 			CIDs = newRoots
 		}
@@ -361,37 +436,31 @@ func fullWriteAt(w io.WriterAt, buff []byte, off int64) error {
 	return nil
 }
 
-func makeFileRoot(ins []cidSizePair) ([]byte, error) {
+func makeFileRoot(ins []cidSizePair, fileSum uint64) ([]byte, error) {
 	links := make([]*pb.PBLink, len(ins))
 	sizes := make([]uint64, len(ins))
-	var sum uint64
 	for i, v := range ins {
-		s := uint64(v.Size)
+		ds := uint64(v.DagSize)
 		links[i] = &pb.PBLink{
 			Hash:  v.Cid.Bytes(),
-			Tsize: &s,
+			Tsize: &ds,
 		}
-		sizes[i] = s
-		sum += s
+		sizes[i] = uint64(v.FileSize)
 	}
 
 	typ := pb.UnixfsData_File
 
-	unixfs := pb.UnixfsData{
-		Filesize:   &sum,
+	unixfsBlob, err := proto.Marshal(&pb.UnixfsData{
+		Filesize:   &fileSum,
 		Blocksizes: sizes,
 		Type:       &typ,
-	}
-
-	unixfsBlob, err := proto.Marshal(&unixfs)
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	node := pb.PBNode{
+	return proto.Marshal(&pb.PBNode{
 		Links: links,
 		Data:  unixfsBlob,
-	}
-
-	return proto.Marshal(&node)
+	})
 }
