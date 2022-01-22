@@ -21,7 +21,7 @@ import (
 const blockTarget = 1024 * 1024                      // 1 MiB
 const carMaxSize = 32*1024*1024*1024 - 1024*1024*128 // ~32 GiB
 const inlineLimit = 32
-const tempFileName = ".temp.car"
+const tempFileNamePattern = ".temp.%s.car"
 
 var rawleafCIDLength int
 var dagPBCIDLength int
@@ -49,109 +49,163 @@ func main() {
 }
 
 func mainRet() int {
-	tempCar, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR, 0o600)
+	tempFileName := fmt.Sprintf(tempFileNamePattern, "A")
+	tempCarA, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error openning tempCar: "+err.Error())
 		return 1
 	}
 	defer os.Remove(tempFileName)
-	defer tempCar.Close()
+	defer tempCarA.Close()
 
-	tempCarConn, err := tempCar.SyscallConn()
+	tempCarAConn, err := tempCarA.SyscallConn()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error getting SyscallConn for tempCar: "+err.Error())
 		return 1
 	}
 
 	var controlR int
-	err = tempCarConn.Control(func(tempCarFd uintptr) {
-		controlR = func(tempCarFd int) int {
-			r := &recursiveTraverser{
-				tempCarFd:     tempCarFd,
-				tempCarOffset: carMaxSize,
-				tempCarFile:   tempCar,
+	err = tempCarAConn.Control(func(tempCarAFd uintptr) {
+		controlR = func(tempCarAFd int) int {
+			tempFileName := fmt.Sprintf(tempFileNamePattern, "B")
+			tempCarB, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error openning tempCar: "+err.Error())
+				return 1
 			}
+			defer os.Remove(tempFileName)
+			defer tempCarB.Close()
 
-			target := os.Args[1]
-			entry, err := os.Lstat(target)
+			tempCarBConn, err := tempCarB.SyscallConn()
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "error stating "+target+": "+err.Error())
-				return 1
-			}
-			c, err := r.do(target, entry)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
-				return 1
-			}
-			var outSize int64
-			out, err := os.OpenFile(os.Args[2], os.O_CREATE|os.O_WRONLY, 0o600)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error opening out file: "+err.Error())
+				fmt.Fprintln(os.Stderr, "error getting SyscallConn for tempCar: "+err.Error())
 				return 1
 			}
 
-			// Writing CAR header
-			{
-				headerBuffer, err := cbor.DumpObject(&car.CarHeader{
-					Roots:   []cid.Cid{c.Cid},
-					Version: 1,
-				})
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "error serialising header: "+err.Error())
-					return 1
-				}
+			err = tempCarBConn.Control(func(tempCarBFd uintptr) {
+				controlR = func(tempCarBFd int) int {
+					r := &recursiveTraverser{
+						tempCarChunk:  swapAbleFile{tempCarA, tempCarAFd},
+						tempCarSend:   swapAbleFile{tempCarB, tempCarBFd},
+						tempCarOffset: carMaxSize,
+						chunkT:        make(chan struct{}, 1),
+						sendT:         make(chan sendJobs, 1),
+						sendOver:      make(chan struct{}),
+					}
+					r.chunkT <- struct{}{}
+					go r.sendWorker()
 
-				varuintHeader := make([]byte, binary.MaxVarintLen64)
-				uvarintSize := binary.PutUvarint(varuintHeader, uint64(len(headerBuffer)))
-				outSize += int64(uvarintSize)
-				err = fullWrite(out, varuintHeader[:uvarintSize])
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "error writing out header varuint: "+err.Error())
-					return 1
-				}
+					target := os.Args[1]
+					entry, err := os.Lstat(target)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "error stating "+target+": "+err.Error())
+						return 1
+					}
+					c, err := r.do(target, entry)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
+						return 1
+					}
+					err = r.swap()
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "error making last swap: "+err.Error())
+						return 1
+					}
+					close(r.sendT)
 
-				outSize += int64(len(headerBuffer))
-				err = fullWrite(out, headerBuffer)
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "error writing out header: "+err.Error())
-					return 1
-				}
-			}
+					fmt.Fprintln(os.Stdout, c.Cid.String())
 
-			// copying tempCar to out
-			err = tempCar.Sync()
+					<-r.sendOver
+
+					return 0
+				}(int(tempCarBFd))
+			})
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "error syncing temp file: "+err.Error())
-				return 1
-			}
-			_, err = tempCar.Seek(r.tempCarOffset, 0)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error seeking temp file: "+err.Error())
-				return 1
-			}
-			_, err = io.Copy(out, tempCar)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error copying to out file: "+err.Error())
-				return 1
-			}
-			outSize += carMaxSize - r.tempCarOffset
-			err = out.Truncate(outSize)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error truncating out file: "+err.Error())
+				fmt.Fprintln(os.Stderr, "error getting FD for tempCarB: "+err.Error())
 				return 1
 			}
 
-			fmt.Fprintln(os.Stderr, c.Cid.String())
-
-			return 0
-		}(int(tempCarFd))
+			return controlR
+		}(int(tempCarAFd))
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error getting FD for tempCar: "+err.Error())
+		fmt.Fprintln(os.Stderr, "error getting FD for tempCarA: "+err.Error())
 		return 1
 	}
 
 	return controlR
+}
+
+func (r *recursiveTraverser) sendWorker() {
+	defer close(r.sendOver)
+	for task := range r.sendT {
+		err := r.send(task)
+		if err != nil {
+			panic(fmt.Errorf("error sending: %e\n", err))
+		}
+		r.chunkT <- struct{}{}
+	}
+}
+
+func (r *recursiveTraverser) send(job sendJobs) error {
+	if job.offset == carMaxSize {
+		// Empty car do nothing.
+		return nil
+	}
+
+	var outSize int64
+	out, err := os.OpenFile(fmt.Sprintf(os.Args[2], r.sendCounter), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening out file: %e", err)
+	}
+	r.sendCounter++
+
+	// Writing CAR header
+	{
+		headerBuffer, err := cbor.DumpObject(&car.CarHeader{
+			Roots:   job.roots,
+			Version: 1,
+		})
+		if err != nil {
+			return fmt.Errorf("serialising header: %e", err)
+		}
+
+		varuintHeader := make([]byte, binary.MaxVarintLen64)
+		uvarintSize := binary.PutUvarint(varuintHeader, uint64(len(headerBuffer)))
+		outSize += int64(uvarintSize)
+		err = fullWrite(out, varuintHeader[:uvarintSize])
+		if err != nil {
+			return fmt.Errorf("writing out header varuint: %e", err)
+		}
+
+		outSize += int64(len(headerBuffer))
+		err = fullWrite(out, headerBuffer)
+		if err != nil {
+			return fmt.Errorf("writing out header: %e", err)
+		}
+	}
+
+	// copying tempCar to out
+	tempCar := r.tempCarSend.File
+	err = tempCar.Sync()
+	if err != nil {
+		return fmt.Errorf("syncing temp file: %e", err)
+	}
+	_, err = tempCar.Seek(job.offset, 0)
+	if err != nil {
+		return fmt.Errorf("seeking temp file: %e", err)
+	}
+	_, err = io.Copy(out, tempCar)
+	if err != nil {
+		return fmt.Errorf("copying to out file: %e", err)
+	}
+	outSize += carMaxSize - job.offset
+	err = out.Truncate(outSize)
+	if err != nil {
+		return fmt.Errorf("truncating out file: %e", err)
+	}
+
+	return nil
 }
 
 func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
@@ -174,7 +228,7 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
 	if err != nil {
 		return cid.Cid{}, fmt.Errorf("taking offset: %e", err)
 	}
-	err = fullWriteAt(r.tempCarFile, rootBlock, off)
+	err = fullWriteAt(r.tempCarChunk.File, rootBlock, off)
 	if err != nil {
 		return cid.Cid{}, fmt.Errorf("writing root's header: %e", err)
 	}
@@ -182,12 +236,29 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
 	return c, nil
 }
 
+type swapAbleFile struct {
+	File *os.File
+	Fd   int
+}
+
+type sendJobs struct {
+	roots  []cid.Cid
+	offset int64
+}
+
 type recursiveTraverser struct {
 	tempCarOffset int64
-	tempCarFile   *os.File
-	tempCarFd     int
+	tempCarChunk  swapAbleFile
+	tempCarSend   swapAbleFile
 
-	roots *cidRootsNode
+	chunkT   chan struct{}
+	sendT    chan sendJobs
+	sendOver chan struct{}
+
+	sendCounter uint
+
+	rootsLen uint
+	roots    *cidRootsNode
 }
 
 type cidRootsNode struct {
@@ -211,6 +282,7 @@ func (rt *recursiveTraverser) addRoot(c *cidSizePair) {
 	if oldFirstNode != nil {
 		oldFirstNode.prev = r
 	}
+	rt.rootsLen++
 }
 
 func (rt *recursiveTraverser) removeRoot(c *cidSizePair) {
@@ -229,6 +301,23 @@ func (rt *recursiveTraverser) removeRoot(c *cidSizePair) {
 	if n != nil {
 		n.prev = p
 	}
+	rt.rootsLen--
+}
+
+func (r *recursiveTraverser) pullRoots() sendJobs {
+	cids := make([]cid.Cid, r.rootsLen)
+	var i uint
+	cur := r.roots
+	for cur != nil {
+		o := cur.c
+		cids[i] = o.Cid
+		o.rootNode = nil
+		cur = cur.next
+		i++
+	}
+	r.roots = nil
+	r.rootsLen = 0
+	return sendJobs{cids, r.tempCarOffset}
 }
 
 type cidSizePair struct {
@@ -404,7 +493,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 			r.addRoot(cp)
 			CIDs[i] = cp
 
-			err = fullWriteAt(r.tempCarFile, append(varuintHeader, c.Bytes()...), carOffset)
+			err = fullWriteAt(r.tempCarChunk.File, append(varuintHeader, c.Bytes()...), carOffset)
 			if err != nil {
 				return nil, fmt.Errorf("writing CID + header: %e", err)
 			}
@@ -417,7 +506,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 			err = fsc.Control(func(rfd uintptr) {
 				// CopyFileRange updates the offset pointers, so let's not clobber them
 				carBlockTarget := carOffset + int64(blockHeaderSize)
-				_, err := unix.CopyFileRange(int(rfd), &fileOffset, r.tempCarFd, &carBlockTarget, int(workSize), 0)
+				_, err := unix.CopyFileRange(int(rfd), &fileOffset, r.tempCarChunk.Fd, &carBlockTarget, int(workSize), 0)
 				if err != nil {
 					errr = fmt.Errorf("error zero-copying for %s: %e", task, err)
 					return
@@ -490,9 +579,24 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 	}
 }
 
+func (r *recursiveTraverser) swap() error {
+	<-r.chunkT
+	r.tempCarSend, r.tempCarChunk = r.tempCarChunk, r.tempCarSend
+	r.sendT <- r.pullRoots()
+	err := r.tempCarChunk.File.Truncate(0)
+	if err != nil {
+		return err
+	}
+	r.tempCarOffset = carMaxSize
+	return nil
+}
+
 func (r *recursiveTraverser) takeOffset(size int64) (int64, error) {
 	if r.tempCarOffset < size {
-		return 0, fmt.Errorf("Asked for %d bytes while %d are available.", size, r.tempCarOffset)
+		err := r.swap()
+		if err != nil {
+			return 0, fmt.Errorf("failed to pump out: %e", err)
+		}
 	}
 	r.tempCarOffset -= size
 	return r.tempCarOffset, nil
