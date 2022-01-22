@@ -72,7 +72,13 @@ func mainRet() int {
 				tempCarFile:   tempCar,
 			}
 
-			c, err := r.do(os.Args[1], nil)
+			target := os.Args[1]
+			entry, err := os.Lstat(target)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error stating "+target+": "+err.Error())
+				return 1
+			}
+			c, err := r.do(target, entry)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
 				return 1
@@ -189,13 +195,6 @@ type cidSizePair struct {
 }
 
 func (r *recursiveTraverser) do(task string, entry os.FileInfo) (cidSizePair, error) {
-	var err error
-	if entry == nil {
-		entry, err = os.Lstat(task)
-		if err != nil {
-			return cidSizePair{}, fmt.Errorf("stating %s: %e\n", task, err)
-		}
-	}
 	switch entry.Mode() & os.ModeType {
 	case os.ModeSymlink:
 		target, err := os.Readlink(task)
