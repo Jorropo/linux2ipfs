@@ -20,7 +20,7 @@ import (
 
 const blockTarget = 1024 * 1024            // 1 MiB
 const carMaxSize = 32 * 1024 * 1024 * 1024 // 32 GiB
-const inlineLimit = 40
+const inlineLimit = 32
 const tempFileName = ".temp.car"
 
 var rawleafCIDLength int
