@@ -3,12 +3,12 @@ module github.com/Jorropo/linux2ipfs
 go 1.17
 
 require (
-	github.com/golang/protobuf v1.5.2
 	github.com/ipfs/go-cid v0.1.0
 	github.com/ipfs/go-ipld-cbor v0.0.5
 	github.com/ipld/go-car v0.3.2
 	github.com/multiformats/go-multihash v0.1.0
 	golang.org/x/sys v0.0.0-20211204120058-94396e421777
+	google.golang.org/protobuf v1.27.1
 )
 
 require (
@@ -48,6 +48,5 @@ require (
 	github.com/whyrusleeping/go-logging v0.0.0-20170515211332-0457bb6b88fc // indirect
 	golang.org/x/crypto v0.0.0-20210506145944-38f3c27a63bf // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
-	google.golang.org/protobuf v1.27.1 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 )
