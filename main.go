@@ -241,13 +241,11 @@ func (r *recursiveTraverser) do(task string) (cidSizePair, error) {
 			err = fsc.Control(func(rfd uintptr) {
 				// CopyFileRange updates the offset pointers, so let's not clobber them
 				carBlockTarget := carOffset + int64(blockHeaderSize)
-				tempFileOffset := fileOffset
-				_, err := unix.CopyFileRange(int(rfd), &tempFileOffset, r.tempCarFd, &carBlockTarget, int(workSize), 0)
+				_, err := unix.CopyFileRange(int(rfd), &fileOffset, r.tempCarFd, &carBlockTarget, int(workSize), 0)
 				if err != nil {
 					errr = fmt.Errorf("error zero-copying for %s: %e", task, err)
 					return
 				}
-				fileOffset += workSize
 			})
 			if err != nil {
 				return cidSizePair{}, fmt.Errorf("error controling for %s: %e", task, err)
