@@ -54,7 +54,7 @@ func mainRet() int {
 		fmt.Println("error openning tempCar: " + err.Error())
 		return 1
 	}
-	//defer os.Remove(tempFileName)
+	defer os.Remove(tempFileName)
 	defer tempCar.Close()
 
 	tempCarConn, err := tempCar.SyscallConn()
@@ -103,8 +103,6 @@ func mainRet() int {
 					fmt.Println("error writing out header varuint: " + err.Error())
 					return 1
 				}
-
-				fmt.Printf("cbor length: %d\n", len(headerBuffer))
 
 				outSize += int64(len(headerBuffer))
 				err = fullWrite(out, headerBuffer)
@@ -348,10 +346,6 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (cidSizePair, er
 
 		if len(CIDs) == 0 {
 			panic("Internal bug!")
-		}
-
-		for _, v := range CIDs {
-			fmt.Println(v.Cid.String())
 		}
 
 		for len(CIDs) != 1 {
