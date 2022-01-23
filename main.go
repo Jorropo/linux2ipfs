@@ -23,7 +23,7 @@ import (
 	mh "github.com/multiformats/go-multihash"
 )
 
-const blockTarget = 1024 * 1024                      // 1 MiB
+const blockTarget = 1024 * 1024 * 2                  // 2 MiB
 const carMaxSize = 32*1024*1024*1024 - 1024*1024*128 // ~32 GiB
 const inlineLimit = 32
 const tempFileNamePattern = ".temp.%s.car"
