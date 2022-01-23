@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -27,6 +29,7 @@ const inlineLimit = 32
 const tempFileNamePattern = ".temp.%s.car"
 const envKeyKey = "ESTUARY_KEY"
 const envShuttleKey = "ESTUARY_SHUTTLE"
+const incrementalFile = "old.json"
 
 var rawleafCIDLength int
 var dagPBCIDLength int
@@ -55,7 +58,7 @@ func main() {
 
 func mainRet() int {
 	tempFileName := fmt.Sprintf(tempFileNamePattern, "A")
-	tempCarA, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR, 0o600)
+	tempCarA, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error openning tempCar: "+err.Error())
 		return 1
@@ -73,7 +76,7 @@ func mainRet() int {
 	err = tempCarAConn.Control(func(tempCarAFd uintptr) {
 		controlR = func(tempCarAFd int) int {
 			tempFileName := fmt.Sprintf(tempFileNamePattern, "B")
-			tempCarB, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR, 0o600)
+			tempCarB, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "error openning tempCar: "+err.Error())
 				return 1
@@ -102,13 +105,40 @@ func mainRet() int {
 					r.chunkT <- struct{}{}
 					go r.sendWorker()
 
+					f, err := os.Open(incrementalFile)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+", if you havn't created it do \"echo {} > "+incrementalFile+"\": "+err.Error())
+						return 1
+					}
+					fDoClose := true
+					defer func() {
+						if fDoClose {
+							f.Close()
+						}
+					}()
+
+					err = json.NewDecoder(f).Decode(&r.olds)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "error decoding incremental: "+err.Error())
+						return 1
+					}
+					fDoClose = false
+					err = f.Close()
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
+						return 1
+					}
+					if r.olds.Cids == nil {
+						r.olds.Cids = map[string]*savedCidsPairs{}
+					}
+
 					target := os.Args[1]
 					entry, err := os.Lstat(target)
 					if err != nil {
 						fmt.Fprintln(os.Stderr, "error stating "+target+": "+err.Error())
 						return 1
 					}
-					c, err := r.do(target, entry)
+					c, updated, err := r.do(target, entry)
 					if err != nil {
 						fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
 						return 1
@@ -121,6 +151,36 @@ func mainRet() int {
 					close(r.sendT)
 
 					fmt.Fprintln(os.Stdout, c.Cid.String())
+
+					if updated {
+						fmt.Fprintln(os.Stderr, "updated")
+						r.olds.LastUpdate = time.Now()
+						f, err = os.OpenFile(incrementalFile, os.O_WRONLY|os.O_TRUNC, 0o600)
+						if err != nil {
+							fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+": "+err.Error())
+							return 1
+						}
+						fDoClose := true
+						defer func() {
+							if fDoClose {
+								f.Close()
+							}
+						}()
+
+						err = json.NewEncoder(f).Encode(&r.olds)
+						if err != nil {
+							fmt.Fprintln(os.Stderr, "error writing "+incrementalFile+": "+err.Error())
+							return 1
+						}
+						fDoClose = false
+						err = f.Close()
+						if err != nil {
+							fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
+							return 1
+						}
+					} else {
+						fmt.Fprintln(os.Stderr, "non-updated")
+					}
 
 					<-r.sendOver
 
@@ -336,7 +396,17 @@ type recursiveTraverser struct {
 
 	toSend []*cidSizePair
 
+	olds struct {
+		Cids       map[string]*savedCidsPairs `json:"cids,omitempty"`
+		LastUpdate time.Time                  `json:"lastUpdate,omitempty"`
+	}
+
 	client http.Client
+}
+
+type savedCidsPairs struct {
+	Cid     string `json:"cid"`
+	DagSize int64  `json:"dagSize"`
 }
 
 func (rt *recursiveTraverser) newBlock(c *cidSizePair) {
@@ -355,12 +425,25 @@ type cidSizePair struct {
 	DagSize  int64
 }
 
-func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, error) {
+func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, bool, error) {
 	switch entry.Mode() & os.ModeType {
 	case os.ModeSymlink:
+		old, oldExists := r.olds.Cids[task]
+		if oldExists && entry.ModTime().Before(r.olds.LastUpdate) {
+			// Recover old link
+			c, err := cid.Decode(old.Cid)
+			if err != nil {
+				return nil, false, fmt.Errorf("decoding old cid \"%s\": %e", old.Cid, err)
+			}
+			return &cidSizePair{
+				Cid:     c,
+				DagSize: old.DagSize,
+			}, false, nil
+		}
+
 		target, err := os.Readlink(task)
 		if err != nil {
-			return nil, fmt.Errorf("resolving symlink %s: %e", task, err)
+			return nil, false, fmt.Errorf("resolving symlink %s: %e", task, err)
 		}
 
 		typ := pb.UnixfsData_Symlink
@@ -370,47 +453,63 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 			Data: []byte(target),
 		})
 		if err != nil {
-			return nil, fmt.Errorf("marshaling unixfs %s: %e\n", task, err)
+			return nil, false, fmt.Errorf("marshaling unixfs %s: %e\n", task, err)
 		}
 
 		data, err = proto.Marshal(&pb.PBNode{Data: data})
 		if err != nil {
-			return nil, fmt.Errorf("marshaling ipld %s: %e\n", task, err)
+			return nil, false, fmt.Errorf("marshaling ipld %s: %e\n", task, err)
 		}
 
 		hash, err := mh.Encode(data, mh.IDENTITY)
 		if err != nil {
-			return nil, fmt.Errorf("inlining %s: %e", task, err)
+			return nil, false, fmt.Errorf("inlining %s: %e", task, err)
 		}
 
+		c := cid.NewCidV1(cid.DagProtobuf, hash)
+		var new bool
+		if oldExists {
+			new = c.String() != old.Cid
+		} else {
+			new = true
+		}
+		dagSize := int64(len(data))
+		if new {
+			r.olds.Cids[task] = &savedCidsPairs{
+				Cid:     c.String(),
+				DagSize: dagSize,
+			}
+		}
 		return &cidSizePair{
-			Cid:     cid.NewCidV1(cid.DagProtobuf, hash),
-			DagSize: int64(len(data)),
-		}, nil
+			Cid:     c,
+			DagSize: dagSize,
+		}, new, nil
 	case os.ModeDir:
+		old, oldExists := r.olds.Cids[task]
+		new := oldExists && entry.ModTime().After(r.olds.LastUpdate)
+
 		subThings, err := os.ReadDir(task)
 		if err != nil {
-			return nil, fmt.Errorf("ReadDir %s: %e\n", task, err)
+			return nil, false, fmt.Errorf("ReadDir %s: %e\n", task, err)
 		}
 
 		links := make([]*pb.PBLink, len(subThings))
 
-		var fileSum int64
 		var dagSum int64
 		sCids := make([]*cidSizePair, len(subThings))
 		for i, v := range subThings {
 			sInfo, err := v.Info()
 			if err != nil {
-				return nil, fmt.Errorf("getting info of %s/%s: %e", task, v.Name(), err)
+				return nil, false, fmt.Errorf("getting info of %s/%s: %e", task, v.Name(), err)
 			}
-			sCid, err := r.do(task+"/"+v.Name(), sInfo)
+			sCid, updated, err := r.do(task+"/"+v.Name(), sInfo)
+			new = new || updated
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 
 			sCids[i] = sCid
 
-			fileSum += sCid.FileSize
 			dagSum += sCid.DagSize
 			sSize := uint64(sCid.DagSize)
 			n := v.Name()
@@ -421,30 +520,69 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 			}
 		}
 
+		if !new {
+			// Recover old link
+			c, err := cid.Decode(old.Cid)
+			if err != nil {
+				return nil, false, fmt.Errorf("decoding old cid \"%s\": %e", old.Cid, err)
+			}
+			return &cidSizePair{
+				Cid:     c,
+				DagSize: old.DagSize,
+			}, false, nil
+		}
+
 		data, err := proto.Marshal(&pb.PBNode{
 			Links: links,
 			Data:  directoryData,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("can't Marshal directory %s: %e", task, err)
+			return nil, false, fmt.Errorf("can't Marshal directory %s: %e", task, err)
 		}
 		if len(data) > blockTarget {
-			return nil, fmt.Errorf("%s is exceed block limit, TODO: support sharding directories", task)
+			return nil, false, fmt.Errorf("%s is exceed block limit, TODO: support sharding directories", task)
 		}
 
 		dagSum += int64(len(data))
 
 		c, err := r.writePBNode(data)
 		if err != nil {
-			return nil, fmt.Errorf("writing directory %s: %e", task, err)
+			return nil, false, fmt.Errorf("writing directory %s: %e", task, err)
 		}
 
-		return &cidSizePair{c, fileSum, dagSum}, nil
+		if oldExists {
+			new = c.String() != old.Cid
+		} else {
+			new = true
+		}
+		if new {
+			r.olds.Cids[task] = &savedCidsPairs{
+				Cid:     c.String(),
+				DagSize: dagSum,
+			}
+		}
+		return &cidSizePair{
+			Cid:     c,
+			DagSize: dagSum,
+		}, new, nil
 	default:
 		// File
+		old, oldExists := r.olds.Cids[task]
+		if oldExists && entry.ModTime().Before(r.olds.LastUpdate) {
+			// Recover old link
+			c, err := cid.Decode(old.Cid)
+			if err != nil {
+				return nil, false, fmt.Errorf("decoding old cid \"%s\": %e", old.Cid, err)
+			}
+			return &cidSizePair{
+				Cid:     c,
+				DagSize: old.DagSize,
+			}, false, nil
+		}
+
 		f, err := os.Open(task)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open %s: %e", task, err)
+			return nil, false, fmt.Errorf("failed to open %s: %e", task, err)
 		}
 		defer f.Close()
 
@@ -471,11 +609,11 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 				data := make([]byte, workSize)
 				_, err := io.ReadFull(f, data)
 				if err != nil {
-					return nil, fmt.Errorf("reading %s: %e", task, err)
+					return nil, false, fmt.Errorf("reading %s: %e", task, err)
 				}
 				hash, err := mh.Encode(data, mh.IDENTITY)
 				if err != nil {
-					return nil, fmt.Errorf("inlining %s: %e", task, err)
+					return nil, false, fmt.Errorf("inlining %s: %e", task, err)
 				}
 				CIDs[i] = &cidSizePair{
 					Cid:      cid.NewCidV1(cid.Raw, hash),
@@ -493,17 +631,17 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 
 			carOffset, err := r.takeOffset(int64(blockHeaderSize) + workSize)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 
 			hash := sha256.New()
 			_, err = io.CopyN(hash, f, workSize)
 			if err != nil {
-				return nil, fmt.Errorf("hashing %s: %e", task, err)
+				return nil, false, fmt.Errorf("hashing %s: %e", task, err)
 			}
 			mhash, err := mh.Encode(hash.Sum(nil), mh.SHA2_256)
 			if err != nil {
-				return nil, fmt.Errorf("encoding multihash for %s: %e", task, err)
+				return nil, false, fmt.Errorf("encoding multihash for %s: %e", task, err)
 			}
 			c := cid.NewCidV1(cid.Raw, mhash)
 			cp := &cidSizePair{
@@ -516,12 +654,12 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 
 			err = fullWriteAt(r.tempCarChunk.File, append(varuintHeader, c.Bytes()...), carOffset)
 			if err != nil {
-				return nil, fmt.Errorf("writing CID + header: %e", err)
+				return nil, false, fmt.Errorf("writing CID + header: %e", err)
 			}
 
 			fsc, err := f.SyscallConn()
 			if err != nil {
-				return nil, fmt.Errorf("openning SyscallConn for %s: %e", task, err)
+				return nil, false, fmt.Errorf("openning SyscallConn for %s: %e", task, err)
 			}
 			var errr error
 			err = fsc.Control(func(rfd uintptr) {
@@ -534,10 +672,10 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 				}
 			})
 			if err != nil {
-				return nil, fmt.Errorf("controling for %s: %e", task, err)
+				return nil, false, fmt.Errorf("controling for %s: %e", task, err)
 			}
 			if errr != nil {
-				return nil, errr
+				return nil, false, errr
 			}
 		}
 
@@ -560,14 +698,14 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 				var dagSum int64 = int64(CIDs[0].DagSize) + int64(CIDs[1].DagSize)
 				lastRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
 				if err != nil {
-					return nil, fmt.Errorf("building a root for %s: %e", task, err)
+					return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
 				}
 				for len(CIDs) > CIDCountAttempt {
 					fileSum += CIDs[CIDCountAttempt].FileSize
 					CIDCountAttempt++
 					newRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
 					if err != nil {
-						return nil, fmt.Errorf("building a root for %s: %e", task, err)
+						return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
 					}
 					if len(newRoot) > blockTarget {
 						CIDCountAttempt--
@@ -581,7 +719,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 
 				c, err := r.writePBNode(lastRoot)
 				if err != nil {
-					return nil, fmt.Errorf("writing root for %s: %e", task, err)
+					return nil, false, fmt.Errorf("writing root for %s: %e", task, err)
 				}
 				CIDs = CIDs[CIDCountAttempt:]
 
@@ -591,7 +729,20 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, e
 			CIDs = newRoots
 		}
 
-		return CIDs[0], nil
+		c := CIDs[0]
+		var new bool
+		if oldExists {
+			new = c.Cid.String() != old.Cid
+		} else {
+			new = true
+		}
+		if new {
+			r.olds.Cids[task] = &savedCidsPairs{
+				Cid:     c.Cid.String(),
+				DagSize: c.DagSize,
+			}
+		}
+		return c, new, nil
 	}
 }
 
