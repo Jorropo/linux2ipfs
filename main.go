@@ -178,14 +178,21 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 	for len(cidsToLink) != 1 {
 		candidateCount := 2
 		sSize := *cidsToLink[0].Tsize + *cidsToLink[1].Tsize
-		lastBlockData, err := makeFakeRoot(cidsToLink[:candidateCount], sSize)
+		lastBlockData, err := proto.Marshal(&pb.PBNode{
+			Links: cidsToLink[:candidateCount],
+			Data:  directoryData,
+		})
 		if err != nil {
 			return fmt.Errorf("serialising fake root: %e", err)
 		}
 		for len(cidsToLink) > candidateCount {
 			sSize += *cidsToLink[candidateCount].Tsize
 			candidateCount++
-			newBlockData, err := makeFakeRoot(cidsToLink[:candidateCount], sSize)
+
+			newBlockData, err := proto.Marshal(&pb.PBNode{
+				Links: cidsToLink[:candidateCount],
+				Data:  directoryData,
+			})
 			if err != nil {
 				return fmt.Errorf("serialising fake root: %e", err)
 			}
@@ -269,18 +276,6 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 	}
 
 	return nil
-}
-
-func makeFakeRoot(links []*pb.PBLink, sSize uint64) ([]byte, error) {
-	data, err := proto.Marshal(&pb.PBNode{
-		Links: links,
-		Data:  directoryData,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("can't Marshal rooting directory: %e", err)
-	}
-
-	return data, nil
 }
 
 func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
