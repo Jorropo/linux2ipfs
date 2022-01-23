@@ -243,7 +243,6 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 		var err error
 		for low <= high {
 			median := (low + high) / 2
-			fmt.Printf("tested %d\n", median)
 
 			blockData, err = proto.Marshal(&pb.PBNode{
 				Links: cidsToLink[:median],
