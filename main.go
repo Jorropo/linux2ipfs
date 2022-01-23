@@ -236,49 +236,65 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 	// Write a linking root if we have multiple roots
 	var data []byte
 	for len(cidsToLink) != 1 {
-		candidateCount := 2
-		sSize := *cidsToLink[0].Tsize + *cidsToLink[1].Tsize
-		lastBlockData, err := proto.Marshal(&pb.PBNode{
-			Links: cidsToLink[:candidateCount],
-			Data:  directoryData,
-		})
-		if err != nil {
-			return fmt.Errorf("serialising fake root: %e", err)
-		}
-		for len(cidsToLink) > candidateCount {
-			sSize += *cidsToLink[candidateCount].Tsize
-			candidateCount++
+		// Binary search the optimal amount of roots to link
+		low := 2
+		high := len(cidsToLink) - 1
+		var blockData []byte
+		var err error
+		for low <= high {
+			median := (low + high) / 2
+			fmt.Printf("tested %d\n", median)
 
-			newBlockData, err := proto.Marshal(&pb.PBNode{
-				Links: cidsToLink[:candidateCount],
+			blockData, err = proto.Marshal(&pb.PBNode{
+				Links: cidsToLink[:median],
 				Data:  directoryData,
 			})
 			if err != nil {
 				return fmt.Errorf("serialising fake root: %e", err)
 			}
 
-			if len(newBlockData) > blockTarget {
-				candidateCount--
-				sSize -= *cidsToLink[candidateCount].Tsize
-				break
+			l := len(blockData)
+			if l == blockTarget {
+				low = median
+				goto AfterPerfectSize
 			}
-			lastBlockData = newBlockData
+			if l < blockTarget {
+				low = median + 1
+			} else {
+				high = median - 1
+			}
 		}
-		sSize += uint64(len(data))
-		cidsToLink = cidsToLink[candidateCount-1:] // Saving space to overwrite the first element with the new directory
+		{
+			// in case we finished by too big estimation, fix them by reserialising the correct amount
+			if len(blockData) > blockTarget {
+				blockData, err = proto.Marshal(&pb.PBNode{
+					Links: cidsToLink[:low],
+					Data:  directoryData,
+				})
+				if err != nil {
+					return fmt.Errorf("serialising fake root: %e", err)
+				}
+			}
+		}
+	AfterPerfectSize:
+		sSize := uint64(len(blockData))
+		for _, v := range cidsToLink[:low] {
+			sSize += *v.Tsize
+		}
+		cidsToLink = cidsToLink[low-1:] // Saving space to overwrite the first element with the new directory
 
 		// Making block header
-		varuintHeader := make([]byte, binary.MaxVarintLen64+dagPBCIDLength+len(data)+len(lastBlockData))
-		uvarintSize := binary.PutUvarint(varuintHeader, uint64(dagPBCIDLength)+uint64(len(lastBlockData)))
+		varuintHeader := make([]byte, binary.MaxVarintLen64+dagPBCIDLength+len(data)+len(blockData))
+		uvarintSize := binary.PutUvarint(varuintHeader, uint64(dagPBCIDLength)+uint64(len(blockData)))
 		varuintHeader = varuintHeader[:uvarintSize]
 
-		h := sha256.Sum256(lastBlockData)
+		h := sha256.Sum256(blockData)
 		mhash, err := mh.Encode(h[:], mh.SHA2_256)
 		if err != nil {
 			return fmt.Errorf("encoding multihash: %e", err)
 		}
 		c := cid.NewCidV1(cid.DagProtobuf, mhash)
-		data = append(append(append(varuintHeader, c.Bytes()...), lastBlockData...), data...)
+		data = append(append(append(varuintHeader, c.Bytes()...), blockData...), data...)
 		n := strconv.FormatUint(uint64(nameCounter), 32)
 		cidsToLink[0] = &pb.PBLink{
 			Name:  &n,
