@@ -204,6 +204,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 			}
 			lastBlockData = newBlockData
 		}
+		sSize += uint64(len(data))
 		cidsToLink = cidsToLink[candidateCount-1:] // Saving space to overwrite the first element with the new directory
 
 		// Making block header
