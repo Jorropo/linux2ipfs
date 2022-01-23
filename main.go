@@ -484,9 +484,10 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			Cid:     c,
 			DagSize: dagSize,
 		}, new, nil
+
 	case os.ModeDir:
 		old, oldExists := r.olds.Cids[task]
-		new := oldExists && entry.ModTime().After(r.olds.LastUpdate)
+		new := !oldExists || entry.ModTime().After(r.olds.LastUpdate)
 
 		subThings, err := os.ReadDir(task)
 		if err != nil {
@@ -565,6 +566,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			Cid:     c,
 			DagSize: dagSum,
 		}, new, nil
+
 	default:
 		// File
 		old, oldExists := r.olds.Cids[task]
