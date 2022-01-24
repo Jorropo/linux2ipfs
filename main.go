@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,13 +24,13 @@ import (
 	mh "github.com/multiformats/go-multihash"
 )
 
-const blockTarget = 1024 * 1024 * 2                  // 2 MiB
-const carMaxSize = 32*1024*1024*1024 - 1024*1024*128 // ~32 GiB
-const inlineLimit = 32
+const defaultBlockTarget = 1024 * 1024 * 2                  // 2 MiB
+const defaultCarMaxSize = 32*1024*1024*1024 - 1024*1024*128 // ~32 GiB
+const defaultInlineLimit = 32
 const tempFileNamePattern = ".temp.%s.car"
 const envKeyKey = "ESTUARY_KEY"
 const envShuttleKey = "ESTUARY_SHUTTLE"
-const incrementalFile = "old.json"
+const defaultIncrementalFile = "old.json"
 
 var rawleafCIDLength int
 var dagPBCIDLength int
@@ -50,13 +51,89 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	flag.Usage = func() {
+		o := flag.CommandLine.Output()
+		fmt.Fprint(o, "Usage for: "+os.Args[0]+` <target file path>
+
+Environ:
+  - `+envKeyKey+` estuary API key REQUIRED
+  - `+envShuttleKey+` shuttle domain REQUIRED
+
+Positional:
+  <target file path> REQUIRED
+
+Flags:
+`)
+		flag.PrintDefaults()
+		fmt.Fprintln(o, "Sample:\n  "+envKeyKey+"=EST...ARY "+envShuttleKey+"=shuttle-4.estuary.tech "+os.Args[0]+" fileToUpload/")
+	}
 }
 
 func main() {
 	os.Exit(mainRet())
 }
 
+var blockTarget int64
+var carMaxSize int64
+var inlineLimit int
+
 func mainRet() int {
+	var incrementalFile string
+	var target string
+	estuaryKey := os.Getenv(envKeyKey)
+	estuaryShuttle := os.Getenv(envShuttleKey)
+	{
+		flag.Int64Var(&blockTarget, "block-target", defaultBlockTarget, "Maximum size of blocks.")
+		flag.Int64Var(&carMaxSize, "car-size", defaultCarMaxSize, "Car reset point, this is mostly how big you want your CARs to be, but it actually is at which point does it stop adding more blocks to it, there is often a 1~128MiB more data to sent (the fakeroots and the header).")
+		flag.IntVar(&inlineLimit, "inline-limit", defaultInlineLimit, "The maximum size at which to attempt to inline blocks.")
+		flag.StringVar(&incrementalFile, "incremental-file", defaultIncrementalFile, "Path to the file which stores the old CIDs and old update time.")
+		flag.Parse()
+
+		bad := false
+
+		if estuaryKey == "" {
+			fmt.Fprintln(os.Stderr, "error empty "+envKeyKey+" envKey")
+			bad = bad || true
+		}
+		if estuaryShuttle == "" {
+			fmt.Fprintln(os.Stderr, "error empty "+envShuttleKey+" envKey")
+			bad = bad || true
+		}
+
+		if blockTarget < 1024 {
+			fmt.Fprintln(os.Stderr, "error block-target should be at least 1024 bytes")
+			bad = bad || true
+		}
+		if blockTarget > 1024*1024*2 {
+			fmt.Fprintln(os.Stderr, "error block-target cannot be bigger than 2MiB")
+			bad = bad || true
+		}
+		if carMaxSize < blockTarget {
+			fmt.Fprintln(os.Stderr, "error car-size cannot be smaller than block-target")
+			bad = bad || true
+		}
+		if inlineLimit < 0 {
+			fmt.Fprintln(os.Stderr, "error inline-limit cannot be negative")
+			bad = bad || true
+		}
+		if incrementalFile == "" {
+			fmt.Fprintln(os.Stderr, "error empty incremental-file")
+			bad = bad || true
+		}
+
+		if args := flag.Args(); len(args) != 1 {
+			fmt.Fprintln(os.Stderr, "error expected one positional <target file path>")
+			bad = bad || true
+		} else {
+			target = args[0]
+		}
+
+		if bad {
+			return 1
+		}
+	}
+
 	tempFileName := fmt.Sprintf(tempFileNamePattern, "A")
 	tempCarA, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -99,8 +176,8 @@ func mainRet() int {
 						chunkT:         make(chan struct{}, 1),
 						sendT:          make(chan sendJobs, 1),
 						sendOver:       make(chan struct{}),
-						estuaryKey:     os.Getenv(envKeyKey),
-						estuaryShuttle: "https://" + os.Getenv(envShuttleKey) + "/content/add-car",
+						estuaryKey:     estuaryKey,
+						estuaryShuttle: "https://" + estuaryShuttle + "/content/add-car",
 					}
 					r.chunkT <- struct{}{}
 					go r.sendWorker()
@@ -132,7 +209,6 @@ func mainRet() int {
 						r.olds.Cids = map[string]*savedCidsPairs{}
 					}
 
-					target := os.Args[1]
 					entry, err := os.Lstat(target)
 					if err != nil {
 						fmt.Fprintln(os.Stderr, "error stating "+target+": "+err.Error())
@@ -252,7 +328,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 				return fmt.Errorf("serialising fake root: %e", err)
 			}
 
-			l := len(blockData)
+			l := int64(len(blockData))
 			if l == blockTarget {
 				low = median
 				goto AfterPerfectSize
@@ -265,7 +341,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 		}
 		{
 			// in case we finished by too big estimation, fix them by reserialising the correct amount
-			if len(blockData) > blockTarget {
+			if int64(len(blockData)) > blockTarget {
 				blockData, err = proto.Marshal(&pb.PBNode{
 					Links: cidsToLink[:low],
 					Data:  directoryData,
@@ -555,7 +631,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 		if err != nil {
 			return nil, false, fmt.Errorf("can't Marshal directory %s: %e", task, err)
 		}
-		if len(data) > blockTarget {
+		if int64(len(data)) > blockTarget {
 			return nil, false, fmt.Errorf("%s is exceed block limit, TODO: support sharding directories", task)
 		}
 
@@ -622,7 +698,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			}
 			sizeLeft -= workSize
 
-			if workSize <= inlineLimit {
+			if workSize <= int64(inlineLimit) {
 				data := make([]byte, workSize)
 				_, err := io.ReadFull(f, data)
 				if err != nil {
@@ -724,7 +800,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 					if err != nil {
 						return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
 					}
-					if len(newRoot) > blockTarget {
+					if int64(len(newRoot)) > blockTarget {
 						CIDCountAttempt--
 						fileSum -= CIDs[CIDCountAttempt].FileSize
 						break
