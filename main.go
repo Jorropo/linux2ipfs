@@ -223,8 +223,7 @@ func mainRet() int {
 
 	fmt.Fprintln(os.Stdout, c.Cid.String())
 
-	if updated {
-		fmt.Fprintln(os.Stderr, "updated")
+	{
 		r.olds.LastUpdate = time.Now()
 		f, err = os.OpenFile(incrementalFile, os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
@@ -249,6 +248,9 @@ func mainRet() int {
 			fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
 			return 1
 		}
+	}
+	if updated {
+		fmt.Fprintln(os.Stderr, "updated")
 	} else {
 		fmt.Fprintln(os.Stderr, "non-updated")
 	}
