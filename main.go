@@ -278,6 +278,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 
 	// Write a linking root if we have multiple roots
 	var data []byte
+	var doneOnce bool
 	for len(cidsToLink) != 1 {
 		// Binary search the optimal amount of roots to link
 		low := 2
@@ -294,6 +295,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 			if err != nil {
 				return fmt.Errorf("serialising fake root: %e", err)
 			}
+			doneOnce = true
 
 			l := int64(len(blockData))
 			if l == blockTarget {
@@ -308,7 +310,8 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 		}
 		{
 			// in case we finished by too big estimation, fix them by reserialising the correct amount
-			if int64(len(blockData)) > blockTarget {
+			// also serialise in case there were only 2 links
+			if int64(len(blockData)) > blockTarget || !doneOnce {
 				blockData, err = proto.Marshal(&pb.PBNode{
 					Links: cidsToLink[:low],
 					Data:  directoryData,
