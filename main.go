@@ -127,6 +127,10 @@ func mainRet() int {
 			bad = bad || true
 		} else {
 			target = args[0]
+			l := len(target) - 1
+			if target[l] == '/' {
+				target = target[:l]
+			}
 		}
 
 		if bad {
