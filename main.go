@@ -475,6 +475,10 @@ type cidSizePair struct {
 	DagSize  int64
 }
 
+func (cp *cidSizePair) String() string {
+	return cp.Cid.String() + " fileSize: " + strconv.FormatInt(cp.FileSize, 10) + " dagSize: " + strconv.FormatInt(cp.DagSize, 10)
+}
+
 func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, bool, error) {
 	switch entry.Mode() & os.ModeType {
 	case os.ModeSymlink:
