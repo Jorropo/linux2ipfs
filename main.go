@@ -693,7 +693,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						return nil, false, err
 					}
 					r.toSend = append(r.toSend, CIDs[sentCounter:i]...)
-					sentCounter += i - sentCounter
+					sentCounter = i
 					err = r.swap()
 					if err != nil {
 						return nil, false, fmt.Errorf("swapping: %e", err)
