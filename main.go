@@ -10,10 +10,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
-
-	"golang.org/x/sys/unix"
 
 	pb "github.com/Jorropo/linux2ipfs/pb"
 	proto "google.golang.org/protobuf/proto"
@@ -22,6 +21,9 @@ import (
 	cbor "github.com/ipfs/go-ipld-cbor"
 	car "github.com/ipld/go-car"
 	mh "github.com/multiformats/go-multihash"
+
+	"go.uber.org/multierr"
+	"golang.org/x/sys/unix"
 )
 
 const defaultBlockTarget = 1024 * 1024 * 2                  // 2 MiB
@@ -81,6 +83,7 @@ var inlineLimit int64
 func mainRet() int {
 	var incrementalFile string
 	var target string
+	var concurrentChunkers int64
 	estuaryKey := os.Getenv(envKeyKey)
 	estuaryShuttle := os.Getenv(envShuttleKey)
 	{
@@ -88,6 +91,7 @@ func mainRet() int {
 		flag.Int64Var(&carMaxSize, "car-size", defaultCarMaxSize, "Car reset point, this is mostly how big you want your CARs to be, but it actually is at which point does it stop adding more blocks to it, there is often a 1~128MiB more data to sent (the fakeroots and the header).")
 		flag.Int64Var(&inlineLimit, "inline-limit", defaultInlineLimit, "The maximum size at which to attempt to inline blocks.")
 		flag.StringVar(&incrementalFile, "incremental-file", defaultIncrementalFile, "Path to the file which stores the old CIDs and old update time.")
+		flag.Int64Var(&concurrentChunkers, "concurrent-chunkers", 0, "Number of chunkers to concurrently run, 0 == Num CPUs (note, this only works intra file, the discovery loop is still single threaded).")
 		flag.Parse()
 
 		bad := false
@@ -120,6 +124,9 @@ func mainRet() int {
 		if incrementalFile == "" {
 			fmt.Fprintln(os.Stderr, "error empty incremental-file")
 			bad = bad || true
+		}
+		if concurrentChunkers == 0 {
+			concurrentChunkers = int64(runtime.NumCPU())
 		}
 
 		if args := flag.Args(); len(args) != 1 {
@@ -157,17 +164,18 @@ func mainRet() int {
 	defer tempCarB.Close()
 
 	r := &recursiveTraverser{
-		tempCarChunk:   tempCarA,
-		tempCarSend:    tempCarB,
-		tempCarOffset:  carMaxSize,
-		chunkT:         make(chan struct{}, 1),
-		sendT:          make(chan sendJobs, 1),
-		sendOver:       make(chan struct{}),
-		estuaryKey:     estuaryKey,
-		estuaryShuttle: "https://" + estuaryShuttle + "/content/add-car",
+		tempCarChunk:           tempCarA,
+		tempCarSend:            tempCarB,
+		tempCarOffset:          carMaxSize,
+		chunkT:                 make(chan struct{}, 1),
+		sendT:                  make(chan sendJobs, 1),
+		sendOver:               make(chan struct{}),
+		concurrentChunkerCount: concurrentChunkers,
+		estuaryKey:             estuaryKey,
+		estuaryShuttle:         "https://" + estuaryShuttle + "/content/add-car",
 	}
-	r.chunkT <- struct{}{}
 	go r.sendWorker()
+	r.chunkT <- struct{}{}
 
 	f, err := os.Open(incrementalFile)
 	if err != nil {
@@ -415,7 +423,7 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
 	}
 	fakeLeaf := cid.NewCidV1(cid.Raw, mhash)
 	rootBlock := append(append(varuintHeader, fakeLeaf.Bytes()...), data...)
-	r.newBlock(&cidSizePair{
+	r.toSend = append(r.toSend, &cidSizePair{
 		Cid:      fakeLeaf,
 		FileSize: fullSize,
 		DagSize:  fullSize,
@@ -447,6 +455,8 @@ type recursiveTraverser struct {
 	sendT    chan sendJobs
 	sendOver chan struct{}
 
+	concurrentChunkerCount int64
+
 	estuaryKey     string
 	estuaryShuttle string
 
@@ -463,10 +473,6 @@ type recursiveTraverser struct {
 type savedCidsPairs struct {
 	Cid     string `json:"cid"`
 	DagSize int64  `json:"dagSize"`
-}
-
-func (rt *recursiveTraverser) newBlock(c *cidSizePair) {
-	rt.toSend = append(rt.toSend, c)
 }
 
 func (r *recursiveTraverser) pullBlock() sendJobs {
@@ -669,6 +675,13 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			chunkSize := size / blockCount
 			reminder := size - (chunkSize * blockCount)
 			CIDs := make([]*cidSizePair, blockCount)
+			manager := &concurrentChunkerManager{
+				concurrentChunkerCount: r.concurrentChunkerCount,
+				t:                      make(chan struct{}, r.concurrentChunkerCount),
+				e:                      make(chan error),
+			}
+			manager.populate()
+			var sentCounter int64
 
 			var fileOffset int64
 			for i := int64(0); i != blockCount; i++ {
@@ -682,42 +695,39 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				varuintHeader = varuintHeader[:uvarintSize]
 
 				blockHeaderSize := uvarintSize + rawleafCIDLength
+				fullSize := int64(blockHeaderSize) + workSize
 
-				carOffset, err := r.takeOffset(int64(blockHeaderSize) + workSize)
+				carOffset, needSwap := r.mayTakeOffset(fullSize)
+
+				if needSwap {
+					err := manager.waitForAllChunks()
+					if err != nil {
+						return nil, false, err
+					}
+					r.toSend = append(r.toSend, CIDs[sentCounter:i]...)
+					sentCounter += i - sentCounter
+					err = r.swap()
+					if err != nil {
+						return nil, false, fmt.Errorf("swapping: %e", err)
+					}
+					manager.populate()
+					r.tempCarOffset -= fullSize
+					carOffset = r.tempCarOffset
+				}
+
+				err := manager.getChunkToken()
 				if err != nil {
 					return nil, false, err
 				}
-
-				hash := sha256.New()
-				_, err = io.CopyN(hash, f, workSize)
-				if err != nil {
-					return nil, false, fmt.Errorf("hashing %s: %e", task, err)
-				}
-				mhash, err := mh.Encode(hash.Sum(nil), mh.SHA2_256)
-				if err != nil {
-					return nil, false, fmt.Errorf("encoding multihash for %s: %e", task, err)
-				}
-				c := cid.NewCidV1(cid.Raw, mhash)
-				cp := &cidSizePair{
-					Cid:      c,
-					FileSize: workSize,
-					DagSize:  workSize,
-				}
-				r.newBlock(cp)
-				CIDs[i] = cp
-
-				err = fullWriteAt(r.tempCarChunk, append(varuintHeader, c.Bytes()...), carOffset)
-				if err != nil {
-					return nil, false, fmt.Errorf("writing CID + header: %e", err)
-				}
-
-				// CopyFileRange updates the offset pointers, so let's not clobber them
-				carBlockTarget := carOffset + int64(blockHeaderSize)
-				err = r.writeToBackBuffer(f, &fileOffset, &carBlockTarget, int(workSize))
-				if err != nil {
-					return nil, false, fmt.Errorf("copying \"%s\" to back buffer: %e", task, err)
-				}
+				go r.mkChunk(manager, f, task, &CIDs[i], varuintHeader, int64(blockHeaderSize), workSize, carOffset, fileOffset)
+				fileOffset += workSize
 			}
+
+			err := manager.waitForAllChunks()
+			if err != nil {
+				return nil, false, err
+			}
+			r.toSend = append(r.toSend, CIDs[sentCounter:]...)
 
 			if len(CIDs) == 0 {
 				panic("Internal bug!")
@@ -799,6 +809,86 @@ func (r *recursiveTraverser) swap() error {
 	return nil
 }
 
+type concurrentChunkerManager struct {
+	concurrentChunkerCount int64
+	t                      chan struct{}
+	e                      chan error
+}
+
+func (m *concurrentChunkerManager) populate() {
+	for i := m.concurrentChunkerCount; i != 0; i-- {
+		m.t <- struct{}{}
+	}
+}
+
+func (m *concurrentChunkerManager) getChunkToken() error {
+	select {
+	case <-m.t:
+		return nil
+	case err := <-m.e:
+		return m.handleChunkerChanError(err)
+	}
+}
+
+func (m *concurrentChunkerManager) waitForAllChunks() error {
+	select {
+	case <-m.t:
+		return m.handleChunkerChanError(nil)
+	case err := <-m.e:
+		return m.handleChunkerChanError(err)
+	}
+}
+
+func (m *concurrentChunkerManager) handleChunkerChanError(err error) error {
+	errs := []error{err}
+	for i := m.concurrentChunkerCount - 1; i != 0; i-- {
+		select {
+		case <-m.t:
+		case err = <-m.e:
+			errs = append(errs, err)
+		}
+	}
+	return multierr.Combine(errs...)
+}
+
+func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.File, task string, cidR **cidSizePair, varuintHeader []byte, blockHeaderSize, workSize, carOffset, fileOffset int64) {
+	err := func() error {
+		buff := make([]byte, workSize)
+		err := fullReadAt(f, buff, fileOffset)
+		if err != nil {
+			return fmt.Errorf("reading file: %e", err)
+		}
+		hash := sha256.Sum256(buff)
+		mhash, err := mh.Encode(hash[:], mh.SHA2_256)
+		if err != nil {
+			return fmt.Errorf("encoding multihash for %s: %e", task, err)
+		}
+		c := cid.NewCidV1(cid.Raw, mhash)
+		*cidR = &cidSizePair{
+			Cid:      c,
+			FileSize: workSize,
+			DagSize:  workSize,
+		}
+
+		err = fullWriteAt(r.tempCarChunk, append(varuintHeader, c.Bytes()...), carOffset)
+		if err != nil {
+			return fmt.Errorf("writing CID + header: %e", err)
+		}
+
+		carBlockTarget := carOffset + blockHeaderSize
+		err = r.writeToBackBuffer(f, &fileOffset, &carBlockTarget, int(workSize))
+		if err != nil {
+			return fmt.Errorf("copying \"%s\" to back buffer: %e", task, err)
+		}
+		return nil
+	}()
+	if err != nil {
+		manager.e <- err
+	} else {
+		manager.t <- struct{}{}
+	}
+}
+
 func (r *recursiveTraverser) takeOffset(size int64) (int64, error) {
 	if r.tempCarOffset < size {
 		err := r.swap()
@@ -808,6 +898,14 @@ func (r *recursiveTraverser) takeOffset(size int64) (int64, error) {
 	}
 	r.tempCarOffset -= size
 	return r.tempCarOffset, nil
+}
+
+func (r *recursiveTraverser) mayTakeOffset(size int64) (int64, bool) {
+	if r.tempCarOffset < size {
+		return 0, true
+	}
+	r.tempCarOffset -= size
+	return r.tempCarOffset, false
 }
 
 func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff *int64, woff *int64, l int) error {
@@ -868,6 +966,19 @@ func fullWriteAt(w io.WriterAt, buff []byte, off int64) error {
 			return err
 		}
 		written += int64(n)
+	}
+	return nil
+}
+
+func fullReadAt(w io.ReaderAt, buff []byte, off int64) error {
+	toRead := int64(len(buff))
+	var red int64
+	for toRead != red {
+		n, err := w.ReadAt(buff[red:], off+red)
+		if err != nil {
+			return err
+		}
+		red += int64(n)
 	}
 	return nil
 }
