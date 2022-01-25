@@ -147,140 +147,107 @@ func mainRet() int {
 	defer os.Remove(tempFileName)
 	defer tempCarA.Close()
 
-	tempCarAConn, err := tempCarA.SyscallConn()
+	tempFileName = fmt.Sprintf(tempFileNamePattern, "B")
+	tempCarB, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error getting SyscallConn for tempCar: "+err.Error())
+		fmt.Fprintln(os.Stderr, "error openning tempCar: "+err.Error())
 		return 1
 	}
+	defer os.Remove(tempFileName)
+	defer tempCarB.Close()
 
-	var controlR int
-	err = tempCarAConn.Control(func(tempCarAFd uintptr) {
-		controlR = func(tempCarAFd int) int {
-			tempFileName := fmt.Sprintf(tempFileNamePattern, "B")
-			tempCarB, err := os.OpenFile(tempFileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error openning tempCar: "+err.Error())
-				return 1
-			}
-			defer os.Remove(tempFileName)
-			defer tempCarB.Close()
+	r := &recursiveTraverser{
+		tempCarChunk:   tempCarA,
+		tempCarSend:    tempCarB,
+		tempCarOffset:  carMaxSize,
+		chunkT:         make(chan struct{}, 1),
+		sendT:          make(chan sendJobs, 1),
+		sendOver:       make(chan struct{}),
+		estuaryKey:     estuaryKey,
+		estuaryShuttle: "https://" + estuaryShuttle + "/content/add-car",
+	}
+	r.chunkT <- struct{}{}
+	go r.sendWorker()
 
-			tempCarBConn, err := tempCarB.SyscallConn()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error getting SyscallConn for tempCar: "+err.Error())
-				return 1
-			}
-
-			err = tempCarBConn.Control(func(tempCarBFd uintptr) {
-				controlR = func(tempCarBFd int) int {
-					r := &recursiveTraverser{
-						tempCarChunk:   swapAbleFile{tempCarA, tempCarAFd},
-						tempCarSend:    swapAbleFile{tempCarB, tempCarBFd},
-						tempCarOffset:  carMaxSize,
-						chunkT:         make(chan struct{}, 1),
-						sendT:          make(chan sendJobs, 1),
-						sendOver:       make(chan struct{}),
-						estuaryKey:     estuaryKey,
-						estuaryShuttle: "https://" + estuaryShuttle + "/content/add-car",
-					}
-					r.chunkT <- struct{}{}
-					go r.sendWorker()
-
-					f, err := os.Open(incrementalFile)
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+", if you havn't created it do \"echo {} > "+incrementalFile+"\": "+err.Error())
-						return 1
-					}
-					fDoClose := true
-					defer func() {
-						if fDoClose {
-							f.Close()
-						}
-					}()
-
-					err = json.NewDecoder(f).Decode(&r.olds)
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "error decoding incremental: "+err.Error())
-						return 1
-					}
-					fDoClose = false
-					err = f.Close()
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
-						return 1
-					}
-					if r.olds.Cids == nil {
-						r.olds.Cids = map[string]*savedCidsPairs{}
-					}
-
-					entry, err := os.Lstat(target)
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "error stating "+target+": "+err.Error())
-						return 1
-					}
-					c, updated, err := r.do(target, entry)
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
-						return 1
-					}
-					err = r.swap()
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "error making last swap: "+err.Error())
-						return 1
-					}
-					close(r.sendT)
-
-					fmt.Fprintln(os.Stdout, c.Cid.String())
-
-					if updated {
-						fmt.Fprintln(os.Stderr, "updated")
-						r.olds.LastUpdate = time.Now()
-						f, err = os.OpenFile(incrementalFile, os.O_WRONLY|os.O_TRUNC, 0o600)
-						if err != nil {
-							fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+": "+err.Error())
-							return 1
-						}
-						fDoClose := true
-						defer func() {
-							if fDoClose {
-								f.Close()
-							}
-						}()
-
-						err = json.NewEncoder(f).Encode(&r.olds)
-						if err != nil {
-							fmt.Fprintln(os.Stderr, "error writing "+incrementalFile+": "+err.Error())
-							return 1
-						}
-						fDoClose = false
-						err = f.Close()
-						if err != nil {
-							fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
-							return 1
-						}
-					} else {
-						fmt.Fprintln(os.Stderr, "non-updated")
-					}
-
-					<-r.sendOver
-
-					return 0
-				}(int(tempCarBFd))
-			})
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error getting FD for tempCarB: "+err.Error())
-				return 1
-			}
-
-			return controlR
-		}(int(tempCarAFd))
-	})
+	f, err := os.Open(incrementalFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error getting FD for tempCarA: "+err.Error())
+		fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+", if you havn't created it do \"echo {} > "+incrementalFile+"\": "+err.Error())
 		return 1
 	}
+	fDoClose := true
+	defer func() {
+		if fDoClose {
+			f.Close()
+		}
+	}()
 
-	return controlR
+	err = json.NewDecoder(f).Decode(&r.olds)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error decoding incremental: "+err.Error())
+		return 1
+	}
+	fDoClose = false
+	err = f.Close()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
+		return 1
+	}
+	if r.olds.Cids == nil {
+		r.olds.Cids = map[string]*savedCidsPairs{}
+	}
+
+	entry, err := os.Lstat(target)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error stating "+target+": "+err.Error())
+		return 1
+	}
+	c, updated, err := r.do(target, entry)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
+		return 1
+	}
+	err = r.swap()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error making last swap: "+err.Error())
+		return 1
+	}
+	close(r.sendT)
+
+	fmt.Fprintln(os.Stdout, c.Cid.String())
+
+	if updated {
+		fmt.Fprintln(os.Stderr, "updated")
+		r.olds.LastUpdate = time.Now()
+		f, err = os.OpenFile(incrementalFile, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+": "+err.Error())
+			return 1
+		}
+		fDoClose := true
+		defer func() {
+			if fDoClose {
+				f.Close()
+			}
+		}()
+
+		err = json.NewEncoder(f).Encode(&r.olds)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error writing "+incrementalFile+": "+err.Error())
+			return 1
+		}
+		fDoClose = false
+		err = f.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
+			return 1
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "non-updated")
+	}
+
+	<-r.sendOver
+
+	return 0
 }
 
 func (r *recursiveTraverser) sendWorker() {
@@ -404,16 +371,15 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 	}
 
 	// copying tempCar to out
-	tempCar := r.tempCarSend.File
-	err := tempCar.Sync()
+	err := r.tempCarSend.Sync()
 	if err != nil {
 		return fmt.Errorf("syncing temp file: %e", err)
 	}
-	_, err = tempCar.Seek(job.offset, 0)
+	_, err = r.tempCarSend.Seek(job.offset, 0)
 	if err != nil {
 		return fmt.Errorf("seeking temp file: %e", err)
 	}
-	req, err := http.NewRequest("POST", r.estuaryShuttle, io.MultiReader(buff, tempCar))
+	req, err := http.NewRequest("POST", r.estuaryShuttle, io.MultiReader(buff, r.tempCarSend))
 	if err != nil {
 		return fmt.Errorf("creating the request failed: %e", err)
 	}
@@ -459,17 +425,12 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
 	if err != nil {
 		return cid.Cid{}, fmt.Errorf("taking offset: %e", err)
 	}
-	err = fullWriteAt(r.tempCarChunk.File, rootBlock, off)
+	err = fullWriteAt(r.tempCarChunk, rootBlock, off)
 	if err != nil {
 		return cid.Cid{}, fmt.Errorf("writing root's header: %e", err)
 	}
 
 	return cid.NewCidV1(cid.DagProtobuf, mhash), nil
-}
-
-type swapAbleFile struct {
-	File *os.File
-	Fd   int
 }
 
 type sendJobs struct {
@@ -479,8 +440,8 @@ type sendJobs struct {
 
 type recursiveTraverser struct {
 	tempCarOffset int64
-	tempCarChunk  swapAbleFile
-	tempCarSend   swapAbleFile
+	tempCarChunk  *os.File
+	tempCarSend   *os.File
 
 	chunkT   chan struct{}
 	sendT    chan sendJobs
@@ -745,30 +706,16 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				r.newBlock(cp)
 				CIDs[i] = cp
 
-				err = fullWriteAt(r.tempCarChunk.File, append(varuintHeader, c.Bytes()...), carOffset)
+				err = fullWriteAt(r.tempCarChunk, append(varuintHeader, c.Bytes()...), carOffset)
 				if err != nil {
 					return nil, false, fmt.Errorf("writing CID + header: %e", err)
 				}
 
-				fsc, err := f.SyscallConn()
+				// CopyFileRange updates the offset pointers, so let's not clobber them
+				carBlockTarget := carOffset + int64(blockHeaderSize)
+				err = r.writeToBackBuffer(f, &fileOffset, &carBlockTarget, int(workSize))
 				if err != nil {
-					return nil, false, fmt.Errorf("openning SyscallConn for %s: %e", task, err)
-				}
-				var errr error
-				err = fsc.Control(func(rfd uintptr) {
-					// CopyFileRange updates the offset pointers, so let's not clobber them
-					carBlockTarget := carOffset + int64(blockHeaderSize)
-					_, err := unix.CopyFileRange(int(rfd), &fileOffset, r.tempCarChunk.Fd, &carBlockTarget, int(workSize), 0)
-					if err != nil {
-						errr = fmt.Errorf("error zero-copying for %s: %e", task, err)
-						return
-					}
-				})
-				if err != nil {
-					return nil, false, fmt.Errorf("controling for %s: %e", task, err)
-				}
-				if errr != nil {
-					return nil, false, errr
+					return nil, false, fmt.Errorf("copying \"%s\" to back buffer: %e", task, err)
 				}
 			}
 
@@ -844,7 +791,7 @@ func (r *recursiveTraverser) swap() error {
 	<-r.chunkT
 	r.tempCarSend, r.tempCarChunk = r.tempCarChunk, r.tempCarSend
 	r.sendT <- r.pullBlock()
-	err := r.tempCarChunk.File.Truncate(0)
+	err := r.tempCarChunk.Truncate(0)
 	if err != nil {
 		return err
 	}
@@ -861,6 +808,42 @@ func (r *recursiveTraverser) takeOffset(size int64) (int64, error) {
 	}
 	r.tempCarOffset -= size
 	return r.tempCarOffset, nil
+}
+
+func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff *int64, woff *int64, l int) error {
+	rsc, err := read.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("openning SyscallConn of read: %e", err)
+	}
+	var errr error
+	err = rsc.Control(func(rfd uintptr) {
+		wsc, err := r.tempCarChunk.SyscallConn()
+		if err != nil {
+			errr = fmt.Errorf("openning SyscallConn of write: %e", err)
+			return
+		}
+		err = wsc.Control(func(wfd uintptr) {
+			for l != 0 {
+				n, err := unix.CopyFileRange(int(rfd), roff, int(wfd), woff, l, 0)
+				if err != nil {
+					if err == io.EOF {
+						errr = err
+					} else {
+						errr = fmt.Errorf("zero-copying to back buffer: %e", err)
+					}
+					return
+				}
+				l -= n
+			}
+		})
+		if err != nil {
+			errr = fmt.Errorf("getting Control of write: %e", err)
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("getting Control of read: %e", err)
+	}
+	return errr
 }
 
 func fullWrite(w io.Writer, buff []byte) error {
