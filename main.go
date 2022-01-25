@@ -182,19 +182,13 @@ func mainRet() int {
 		fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+", if you havn't created it do \"echo {} > "+incrementalFile+"\": "+err.Error())
 		return 1
 	}
-	fDoClose := true
-	defer func() {
-		if fDoClose {
-			f.Close()
-		}
-	}()
+	defer f.Close()
 
 	err = json.NewDecoder(f).Decode(&r.olds)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error decoding incremental: "+err.Error())
 		return 1
 	}
-	fDoClose = false
 	err = f.Close()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
@@ -223,31 +217,23 @@ func mainRet() int {
 
 	fmt.Fprintln(os.Stdout, c.Cid.String())
 
-	{
-		r.olds.LastUpdate = time.Now()
-		f, err = os.OpenFile(incrementalFile, os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+": "+err.Error())
-			return 1
-		}
-		fDoClose := true
-		defer func() {
-			if fDoClose {
-				f.Close()
-			}
-		}()
+	r.olds.LastUpdate = time.Now()
+	f, err = os.OpenFile(incrementalFile, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+": "+err.Error())
+		return 1
+	}
+	defer f.Close()
 
-		err = json.NewEncoder(f).Encode(&r.olds)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error writing "+incrementalFile+": "+err.Error())
-			return 1
-		}
-		fDoClose = false
-		err = f.Close()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
-			return 1
-		}
+	err = json.NewEncoder(f).Encode(&r.olds)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error writing "+incrementalFile+": "+err.Error())
+		return 1
+	}
+	err = f.Close()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
+		return 1
 	}
 	if updated {
 		fmt.Fprintln(os.Stderr, "updated")
