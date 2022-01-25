@@ -76,7 +76,7 @@ func main() {
 
 var blockTarget int64
 var carMaxSize int64
-var inlineLimit int
+var inlineLimit int64
 
 func mainRet() int {
 	var incrementalFile string
@@ -86,7 +86,7 @@ func mainRet() int {
 	{
 		flag.Int64Var(&blockTarget, "block-target", defaultBlockTarget, "Maximum size of blocks.")
 		flag.Int64Var(&carMaxSize, "car-size", defaultCarMaxSize, "Car reset point, this is mostly how big you want your CARs to be, but it actually is at which point does it stop adding more blocks to it, there is often a 1~128MiB more data to sent (the fakeroots and the header).")
-		flag.IntVar(&inlineLimit, "inline-limit", defaultInlineLimit, "The maximum size at which to attempt to inline blocks.")
+		flag.Int64Var(&inlineLimit, "inline-limit", defaultInlineLimit, "The maximum size at which to attempt to inline blocks.")
 		flag.StringVar(&incrementalFile, "incremental-file", defaultIncrementalFile, "Path to the file which stores the old CIDs and old update time.")
 		flag.Parse()
 
@@ -679,150 +679,147 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 		}
 		defer f.Close()
 
-		var fileOffset int64
-
+		var c *cidSizePair
 		size := entry.Size()
-		var blockCount int64
-		if size == 0 {
-			blockCount = 1
-		} else {
-			blockCount = (size-1)/blockTarget + 1
-		}
-		sizeLeft := size
-		CIDs := make([]*cidSizePair, blockCount)
-
-		for i := int64(0); i != blockCount; i++ {
-			workSize := sizeLeft
-			if workSize > blockTarget {
-				workSize = blockTarget
+		// This check is really important and doesn't only deal with inlining
+		// This ensures that no zero sized files is chunked (the chunker would fail horribly with thoses)
+		if size <= inlineLimit {
+			data := make([]byte, size)
+			_, err := io.ReadFull(f, data)
+			if err != nil {
+				return nil, false, fmt.Errorf("reading %s: %e", task, err)
 			}
-			sizeLeft -= workSize
+			hash, err := mh.Encode(data, mh.IDENTITY)
+			if err != nil {
+				return nil, false, fmt.Errorf("inlining %s: %e", task, err)
+			}
+			c = &cidSizePair{
+				Cid:      cid.NewCidV1(cid.Raw, hash),
+				FileSize: size,
+				DagSize:  size,
+			}
 
-			if workSize <= int64(inlineLimit) {
-				data := make([]byte, workSize)
-				_, err := io.ReadFull(f, data)
-				if err != nil {
-					return nil, false, fmt.Errorf("reading %s: %e", task, err)
+		} else {
+			blockCount := (size-1)/blockTarget + 1
+			chunkSize := size / blockCount
+			reminder := size - (chunkSize * blockCount)
+			CIDs := make([]*cidSizePair, blockCount)
+
+			var fileOffset int64
+			for i := int64(0); i != blockCount; i++ {
+				workSize := chunkSize
+				if i < reminder {
+					workSize++
 				}
-				hash, err := mh.Encode(data, mh.IDENTITY)
+
+				varuintHeader := make([]byte, binary.MaxVarintLen64+rawleafCIDLength)
+				uvarintSize := binary.PutUvarint(varuintHeader, uint64(rawleafCIDLength)+uint64(workSize))
+				varuintHeader = varuintHeader[:uvarintSize]
+
+				blockHeaderSize := uvarintSize + rawleafCIDLength
+
+				carOffset, err := r.takeOffset(int64(blockHeaderSize) + workSize)
 				if err != nil {
-					return nil, false, fmt.Errorf("inlining %s: %e", task, err)
+					return nil, false, err
 				}
-				CIDs[i] = &cidSizePair{
-					Cid:      cid.NewCidV1(cid.Raw, hash),
+
+				hash := sha256.New()
+				_, err = io.CopyN(hash, f, workSize)
+				if err != nil {
+					return nil, false, fmt.Errorf("hashing %s: %e", task, err)
+				}
+				mhash, err := mh.Encode(hash.Sum(nil), mh.SHA2_256)
+				if err != nil {
+					return nil, false, fmt.Errorf("encoding multihash for %s: %e", task, err)
+				}
+				c := cid.NewCidV1(cid.Raw, mhash)
+				cp := &cidSizePair{
+					Cid:      c,
 					FileSize: workSize,
 					DagSize:  workSize,
 				}
-				continue
-			}
+				r.newBlock(cp)
+				CIDs[i] = cp
 
-			varuintHeader := make([]byte, binary.MaxVarintLen64+rawleafCIDLength)
-			uvarintSize := binary.PutUvarint(varuintHeader, uint64(rawleafCIDLength)+uint64(workSize))
-			varuintHeader = varuintHeader[:uvarintSize]
-
-			blockHeaderSize := uvarintSize + rawleafCIDLength
-
-			carOffset, err := r.takeOffset(int64(blockHeaderSize) + workSize)
-			if err != nil {
-				return nil, false, err
-			}
-
-			hash := sha256.New()
-			_, err = io.CopyN(hash, f, workSize)
-			if err != nil {
-				return nil, false, fmt.Errorf("hashing %s: %e", task, err)
-			}
-			mhash, err := mh.Encode(hash.Sum(nil), mh.SHA2_256)
-			if err != nil {
-				return nil, false, fmt.Errorf("encoding multihash for %s: %e", task, err)
-			}
-			c := cid.NewCidV1(cid.Raw, mhash)
-			cp := &cidSizePair{
-				Cid:      c,
-				FileSize: workSize,
-				DagSize:  workSize,
-			}
-			r.newBlock(cp)
-			CIDs[i] = cp
-
-			err = fullWriteAt(r.tempCarChunk.File, append(varuintHeader, c.Bytes()...), carOffset)
-			if err != nil {
-				return nil, false, fmt.Errorf("writing CID + header: %e", err)
-			}
-
-			fsc, err := f.SyscallConn()
-			if err != nil {
-				return nil, false, fmt.Errorf("openning SyscallConn for %s: %e", task, err)
-			}
-			var errr error
-			err = fsc.Control(func(rfd uintptr) {
-				// CopyFileRange updates the offset pointers, so let's not clobber them
-				carBlockTarget := carOffset + int64(blockHeaderSize)
-				_, err := unix.CopyFileRange(int(rfd), &fileOffset, r.tempCarChunk.Fd, &carBlockTarget, int(workSize), 0)
+				err = fullWriteAt(r.tempCarChunk.File, append(varuintHeader, c.Bytes()...), carOffset)
 				if err != nil {
-					errr = fmt.Errorf("error zero-copying for %s: %e", task, err)
-					return
-				}
-			})
-			if err != nil {
-				return nil, false, fmt.Errorf("controling for %s: %e", task, err)
-			}
-			if errr != nil {
-				return nil, false, errr
-			}
-		}
-
-		if len(CIDs) == 0 {
-			panic("Internal bug!")
-		}
-
-		for len(CIDs) != 1 {
-			// Generate roots
-			var newRoots []*cidSizePair
-			for len(CIDs) != 0 {
-				if len(CIDs) == 1 {
-					// Don't create roots that links to one block, just forward that block
-					newRoots = append(newRoots, CIDs...)
-					break
+					return nil, false, fmt.Errorf("writing CID + header: %e", err)
 				}
 
-				var CIDCountAttempt int = 2
-				var fileSum int64 = int64(CIDs[0].FileSize) + int64(CIDs[1].FileSize)
-				var dagSum int64 = int64(CIDs[0].DagSize) + int64(CIDs[1].DagSize)
-				lastRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
+				fsc, err := f.SyscallConn()
 				if err != nil {
-					return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
+					return nil, false, fmt.Errorf("openning SyscallConn for %s: %e", task, err)
 				}
-				for len(CIDs) > CIDCountAttempt {
-					fileSum += CIDs[CIDCountAttempt].FileSize
-					CIDCountAttempt++
-					newRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
+				var errr error
+				err = fsc.Control(func(rfd uintptr) {
+					// CopyFileRange updates the offset pointers, so let's not clobber them
+					carBlockTarget := carOffset + int64(blockHeaderSize)
+					_, err := unix.CopyFileRange(int(rfd), &fileOffset, r.tempCarChunk.Fd, &carBlockTarget, int(workSize), 0)
+					if err != nil {
+						errr = fmt.Errorf("error zero-copying for %s: %e", task, err)
+						return
+					}
+				})
+				if err != nil {
+					return nil, false, fmt.Errorf("controling for %s: %e", task, err)
+				}
+				if errr != nil {
+					return nil, false, errr
+				}
+			}
+
+			if len(CIDs) == 0 {
+				panic("Internal bug!")
+			}
+
+			for len(CIDs) != 1 {
+				// Generate roots
+				var newRoots []*cidSizePair
+				for len(CIDs) != 0 {
+					if len(CIDs) == 1 {
+						// Don't create roots that links to one block, just forward that block
+						newRoots = append(newRoots, CIDs...)
+						break
+					}
+
+					var CIDCountAttempt int = 2
+					var fileSum int64 = int64(CIDs[0].FileSize) + int64(CIDs[1].FileSize)
+					var dagSum int64 = int64(CIDs[0].DagSize) + int64(CIDs[1].DagSize)
+					lastRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
 					if err != nil {
 						return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
 					}
-					if int64(len(newRoot)) > blockTarget {
-						CIDCountAttempt--
-						fileSum -= CIDs[CIDCountAttempt].FileSize
-						break
+					for len(CIDs) > CIDCountAttempt {
+						fileSum += CIDs[CIDCountAttempt].FileSize
+						CIDCountAttempt++
+						newRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
+						if err != nil {
+							return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
+						}
+						if int64(len(newRoot)) > blockTarget {
+							CIDCountAttempt--
+							fileSum -= CIDs[CIDCountAttempt].FileSize
+							break
+						}
+						lastRoot = newRoot
 					}
-					lastRoot = newRoot
+
+					dagSum += int64(len(lastRoot))
+
+					c, err := r.writePBNode(lastRoot)
+					if err != nil {
+						return nil, false, fmt.Errorf("writing root for %s: %e", task, err)
+					}
+					CIDs = CIDs[CIDCountAttempt:]
+
+					cp := &cidSizePair{c, fileSum, dagSum}
+					newRoots = append(newRoots, cp)
 				}
-
-				dagSum += int64(len(lastRoot))
-
-				c, err := r.writePBNode(lastRoot)
-				if err != nil {
-					return nil, false, fmt.Errorf("writing root for %s: %e", task, err)
-				}
-				CIDs = CIDs[CIDCountAttempt:]
-
-				cp := &cidSizePair{c, fileSum, dagSum}
-				newRoots = append(newRoots, cp)
+				CIDs = newRoots
 			}
-			CIDs = newRoots
+			c = CIDs[0]
 		}
 
-		c := CIDs[0]
 		var new bool
 		if oldExists {
 			new = c.Cid.String() != old.Cid
