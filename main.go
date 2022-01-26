@@ -366,7 +366,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 
 		varuintHeader := make([]byte, binary.MaxVarintLen64+uint64(len(headerBuffer))+uint64(len(data)))
 		uvarintSize := binary.PutUvarint(varuintHeader, uint64(len(headerBuffer)))
-		buff = bytes.NewBuffer(append(append(varuintHeader[:uvarintSize], headerBuffer...), data...))
+		buff = bytes.NewReader(append(append(varuintHeader[:uvarintSize], headerBuffer...), data...))
 	}
 
 	// copying tempCar to out
