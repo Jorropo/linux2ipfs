@@ -128,6 +128,10 @@ func mainRet() int {
 		if concurrentChunkers == 0 {
 			concurrentChunkers = int64(runtime.NumCPU())
 		}
+		if concurrentChunkers < 0 {
+			fmt.Fprintln(os.Stderr, "error negative concurrent chunkers")
+			bad = bad || true
+		}
 
 		if args := flag.Args(); len(args) != 1 {
 			fmt.Fprintln(os.Stderr, "error expected one positional <target file path>")
