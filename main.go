@@ -281,6 +281,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 	for len(cidsToLink) != 1 {
 		// Binary search the optimal amount of roots to link
 		low := 2
+		lastAttempt := 0
 		high := len(cidsToLink) - 1
 		var blockData []byte
 		var err error
@@ -294,6 +295,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 			if err != nil {
 				return fmt.Errorf("serialising fake root: %e", err)
 			}
+			lastAttempt = median
 
 			l := int64(len(blockData))
 			if l == blockTarget {
@@ -309,7 +311,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 		{
 			// in case we finished by too big estimation, fix them by reserialising the correct amount
 			// also serialise in case there were only 2 links
-			if int64(len(blockData)) > blockTarget || len(cidsToLink) == 2 {
+			if low != lastAttempt {
 				blockData, err = proto.Marshal(&pb.PBNode{
 					Links: cidsToLink[:low],
 					Data:  directoryData,
@@ -737,6 +739,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 					}
 
 					low := 2
+					lastAttempt := 0
 					high := len(CIDs) - 1
 					var lastRoot []byte
 					var err error
@@ -748,6 +751,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						if err != nil {
 							return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
 						}
+						lastAttempt = median
 
 						l := int64(len(lastRoot))
 						if l == blockTarget {
@@ -763,7 +767,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 					{
 						// in case we finished by too big estimation, fix them by reserialising the correct amount
 						// also serialise in case there were only 2 links
-						if int64(len(lastRoot)) > blockTarget || len(CIDs) == 2 {
+						if low != lastAttempt {
 							lastRoot, fileSum, err = makeFileRoot(CIDs[:low])
 							if err != nil {
 								return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
