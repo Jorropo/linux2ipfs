@@ -399,7 +399,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 	return nil
 }
 
-func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
+func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, bool, error) {
 	// Making block header
 	varuintHeader := make([]byte, binary.MaxVarintLen64+dagPBCIDLength+len(data))
 	uvarintSize := binary.PutUvarint(varuintHeader, uint64(dagPBCIDLength)+uint64(len(data)))
@@ -410,7 +410,7 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
 	h := sha256.Sum256(data)
 	mhash, err := mh.Encode(h[:], mh.SHA2_256)
 	if err != nil {
-		return cid.Cid{}, fmt.Errorf("encoding multihash: %e", err)
+		return cid.Cid{}, false, fmt.Errorf("encoding multihash: %e", err)
 	}
 	fakeLeaf := cid.NewCidV1(cid.Raw, mhash)
 	rootBlock := append(append(varuintHeader, fakeLeaf.Bytes()...), data...)
@@ -420,16 +420,16 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, error) {
 		DagSize:  fullSize,
 	})
 
-	off, err := r.takeOffset(fullSize)
+	off, swapped, err := r.takeOffset(fullSize)
 	if err != nil {
-		return cid.Cid{}, fmt.Errorf("taking offset: %e", err)
+		return cid.Cid{}, false, fmt.Errorf("taking offset: %e", err)
 	}
 	err = fullWriteAt(r.tempCarChunk, rootBlock, off)
 	if err != nil {
-		return cid.Cid{}, fmt.Errorf("writing root's header: %e", err)
+		return cid.Cid{}, false, fmt.Errorf("writing root's header: %e", err)
 	}
 
-	return cid.NewCidV1(cid.DagProtobuf, mhash), nil
+	return cid.NewCidV1(cid.DagProtobuf, mhash), swapped, nil
 }
 
 type sendJobs struct {
@@ -603,7 +603,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 		dagSum += int64(len(data))
 
-		c, err := r.writePBNode(data)
+		c, _, err := r.writePBNode(data)
 		if err != nil {
 			return nil, false, fmt.Errorf("writing directory %s: %e", task, err)
 		}
@@ -646,6 +646,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 		defer f.Close()
 
 		var c *cidSizePair
+		oldOffset := r.tempCarOffset
 		size := entry.Size()
 		// This check is really important and doesn't only deal with inlining
 		// This ensures that no zero sized files is chunked (the chunker would fail horribly with thoses)
@@ -706,6 +707,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						return nil, false, fmt.Errorf("swapping: %e", err)
 					}
 					manager.populate()
+					oldOffset = carMaxSize
 					r.tempCarOffset -= fullSize
 					carOffset = r.tempCarOffset
 				}
@@ -780,9 +782,12 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						dagSum += v.DagSize
 					}
 
-					c, err := r.writePBNode(lastRoot)
+					c, swapped, err := r.writePBNode(lastRoot)
 					if err != nil {
 						return nil, false, fmt.Errorf("writing root for %s: %e", task, err)
+					}
+					if swapped {
+						oldOffset = carMaxSize
 					}
 					CIDs = CIDs[low:]
 
@@ -805,6 +810,8 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				Cid:     c.Cid.String(),
 				DagSize: c.DagSize,
 			}
+		} else {
+			r.tempCarOffset = oldOffset
 		}
 		return c, new, nil
 	}
@@ -902,15 +909,16 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 	}
 }
 
-func (r *recursiveTraverser) takeOffset(size int64) (int64, error) {
-	if r.tempCarOffset < size {
+func (r *recursiveTraverser) takeOffset(size int64) (int64, bool, error) {
+	swapped := r.tempCarOffset < size
+	if swapped {
 		err := r.swap()
 		if err != nil {
-			return 0, fmt.Errorf("failed to pump out: %e", err)
+			return 0, false, fmt.Errorf("failed to pump out: %e", err)
 		}
 	}
 	r.tempCarOffset -= size
-	return r.tempCarOffset, nil
+	return r.tempCarOffset, swapped, nil
 }
 
 func (r *recursiveTraverser) mayTakeOffset(size int64) (int64, bool) {
