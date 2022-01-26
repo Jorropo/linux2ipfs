@@ -278,7 +278,6 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 
 	// Write a linking root if we have multiple roots
 	var data []byte
-	var doneOnce bool
 	for len(cidsToLink) != 1 {
 		// Binary search the optimal amount of roots to link
 		low := 2
@@ -295,7 +294,6 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 			if err != nil {
 				return fmt.Errorf("serialising fake root: %e", err)
 			}
-			doneOnce = true
 
 			l := int64(len(blockData))
 			if l == blockTarget {
@@ -311,7 +309,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 		{
 			// in case we finished by too big estimation, fix them by reserialising the correct amount
 			// also serialise in case there were only 2 links
-			if int64(len(blockData)) > blockTarget || !doneOnce {
+			if int64(len(blockData)) > blockTarget || len(cidsToLink) == 2 {
 				blockData, err = proto.Marshal(&pb.PBNode{
 					Links: cidsToLink[:low],
 					Data:  directoryData,
@@ -738,35 +736,51 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						break
 					}
 
-					var CIDCountAttempt int = 2
-					var fileSum int64 = int64(CIDs[0].FileSize) + int64(CIDs[1].FileSize)
-					var dagSum int64 = int64(CIDs[0].DagSize) + int64(CIDs[1].DagSize)
-					lastRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
-					if err != nil {
-						return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
-					}
-					for len(CIDs) > CIDCountAttempt {
-						fileSum += CIDs[CIDCountAttempt].FileSize
-						CIDCountAttempt++
-						newRoot, err := makeFileRoot(CIDs[:CIDCountAttempt], uint64(fileSum))
+					low := 2
+					high := len(CIDs) - 1
+					var lastRoot []byte
+					var err error
+					var fileSum int64
+					for low <= high {
+						median := (low + high) / 2
+
+						lastRoot, fileSum, err = makeFileRoot(CIDs[:median])
 						if err != nil {
 							return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
 						}
-						if int64(len(newRoot)) > blockTarget {
-							CIDCountAttempt--
-							fileSum -= CIDs[CIDCountAttempt].FileSize
-							break
-						}
-						lastRoot = newRoot
-					}
 
-					dagSum += int64(len(lastRoot))
+						l := int64(len(lastRoot))
+						if l == blockTarget {
+							low = median
+							goto AfterPerfectSize
+						}
+						if l < blockTarget {
+							low = median + 1
+						} else {
+							high = median - 1
+						}
+					}
+					{
+						// in case we finished by too big estimation, fix them by reserialising the correct amount
+						// also serialise in case there were only 2 links
+						if int64(len(lastRoot)) > blockTarget || len(CIDs) == 2 {
+							lastRoot, fileSum, err = makeFileRoot(CIDs[:low])
+							if err != nil {
+								return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
+							}
+						}
+					}
+				AfterPerfectSize:
+					dagSum := int64(len(lastRoot))
+					for _, v := range CIDs[:low] {
+						dagSum += v.DagSize
+					}
 
 					c, err := r.writePBNode(lastRoot)
 					if err != nil {
 						return nil, false, fmt.Errorf("writing root for %s: %e", task, err)
 					}
-					CIDs = CIDs[CIDCountAttempt:]
+					CIDs = CIDs[low:]
 
 					cp := &cidSizePair{c, fileSum, dagSum}
 					newRoots = append(newRoots, cp)
@@ -978,10 +992,12 @@ func fullReadAt(w io.ReaderAt, buff []byte, off int64) error {
 	return nil
 }
 
-func makeFileRoot(ins []*cidSizePair, fileSum uint64) ([]byte, error) {
+func makeFileRoot(ins []*cidSizePair) ([]byte, int64, error) {
 	links := make([]*pb.PBLink, len(ins))
 	sizes := make([]uint64, len(ins))
+	var fileSum int64
 	for i, v := range ins {
+		fileSum += v.FileSize
 		ds := uint64(v.DagSize)
 		links[i] = &pb.PBLink{
 			Hash:  v.Cid.Bytes(),
@@ -992,17 +1008,19 @@ func makeFileRoot(ins []*cidSizePair, fileSum uint64) ([]byte, error) {
 
 	typ := pb.UnixfsData_File
 
+	ufileSum := uint64(fileSum)
 	unixfsBlob, err := proto.Marshal(&pb.UnixfsData{
-		Filesize:   &fileSum,
+		Filesize:   &ufileSum,
 		Blocksizes: sizes,
 		Type:       &typ,
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return proto.Marshal(&pb.PBNode{
+	data, err := proto.Marshal(&pb.PBNode{
 		Links: links,
 		Data:  unixfsBlob,
 	})
+	return data, fileSum, err
 }
