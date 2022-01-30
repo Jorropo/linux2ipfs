@@ -12,6 +12,8 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/Jorropo/linux2ipfs/pb"
@@ -33,6 +35,10 @@ const tempFileNamePattern = ".temp.%s.car"
 const envKeyKey = "ESTUARY_KEY"
 const envShuttleKey = "ESTUARY_SHUTTLE"
 const defaultIncrementalFile = "old.json"
+const defaultUploadTries = 3
+const defaultUploadFailedOut = "failed"
+
+var talkLock sync.Mutex
 
 var rawleafCIDLength int
 var dagPBCIDLength int
@@ -79,6 +85,8 @@ func main() {
 var blockTarget int64
 var carMaxSize int64
 var inlineLimit int64
+var uploadTries uint
+var uploadFailedOut string
 
 func mainRet() int {
 	var incrementalFile string
@@ -92,6 +100,8 @@ func mainRet() int {
 		flag.Int64Var(&inlineLimit, "inline-limit", defaultInlineLimit, "The maximum size at which to attempt to inline blocks.")
 		flag.StringVar(&incrementalFile, "incremental-file", defaultIncrementalFile, "Path to the file which stores the old CIDs and old update time.")
 		flag.Int64Var(&concurrentChunkers, "concurrent-chunkers", 0, "Number of chunkers to concurrently run, 0 == Num CPUs (note, this only works intra file, the discovery loop is still single threaded).")
+		flag.UintVar(&uploadTries, "max-upload-attempt", defaultUploadTries, "Number of time to try to upload the resulting cars.")
+		flag.StringVar(&uploadFailedOut, "failed-outs", defaultUploadFailedOut, "Where to move failed upload car files in case an upload failed too many times.")
 		flag.Parse()
 
 		bad := false
@@ -131,6 +141,16 @@ func mainRet() int {
 		if concurrentChunkers < 0 {
 			fmt.Fprintln(os.Stderr, "error negative concurrent chunkers")
 			bad = bad || true
+		}
+		if uploadTries == 0 {
+			fmt.Fprintln(os.Stderr, "error zero max-upload-attempt")
+			bad = bad || true
+		}
+		if uploadFailedOut == "" {
+			fmt.Fprintln(os.Stderr, "error empty failed-outs")
+			bad = bad || true
+		} else if l := len(uploadFailedOut) - 1; uploadFailedOut[l] == '/' {
+			uploadFailedOut = uploadFailedOut[:l]
 		}
 
 		if args := flag.Args(); len(args) != 1 {
@@ -252,21 +272,99 @@ func mainRet() int {
 
 func (r *recursiveTraverser) sendWorker() {
 	defer close(r.sendOver)
+TaskLoop:
 	for task := range r.sendT {
-		err := r.send(task)
+		if task.offset == carMaxSize || len(task.roots) == 0 {
+			// Empty car do nothing.
+			continue
+		}
+		header, offset, err := r.makeSendPayload(task)
 		if err != nil {
-			panic(fmt.Errorf("error sending: %e\n", err))
+			panic(fmt.Errorf("creating payload: %e", err))
+		}
+		err = r.tempCarSend.Sync()
+		if err != nil {
+			talkLock.Lock()
+			fmt.Fprintln(os.Stderr, "error syncing temp file: "+err.Error())
+			talkLock.Unlock()
+			continue
+		}
+		for failed := uint(0); failed != uploadTries; failed++ {
+			attemptCount := strconv.FormatUint(uint64(failed), 10) + " / " + strconv.FormatUint(uint64(uploadTries), 10)
+			_, err = r.tempCarSend.Seek(offset, 0)
+			if err != nil {
+				talkLock.Lock()
+				fmt.Fprintln(os.Stderr, "error seeking temp file: "+err.Error())
+				talkLock.Unlock()
+				continue
+			}
+
+			err := r.send(io.MultiReader(bytes.NewReader(header), r.tempCarSend))
+			if err != nil {
+				talkLock.Lock()
+				fmt.Fprintln(os.Stderr, attemptCount+" error sending: "+err.Error())
+				talkLock.Unlock()
+				continue
+			}
+			r.chunkT <- struct{}{}
+			continue TaskLoop
+		}
+
+		// Failed, copy to failedOut
+		r.makeFailedOutDir.Do(func() {
+			err := os.Mkdir(uploadFailedOut, 0o775)
+			if err != nil {
+				panic("failed to create uploadFailedOut directory: " + err.Error())
+			}
+		})
+
+		n := atomic.AddUint32(&r.failedOutCounter, 1)
+		outName := uploadFailedOut + "/" + strconv.FormatUint(uint64(n), 10) + ".car"
+		outF, err := os.OpenFile(outName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			outF.Close()
+			os.Remove(outName)
+			r.chunkT <- struct{}{}
+			talkLock.Lock()
+			fmt.Fprintln(os.Stderr, "error creating failed out file "+outName+":"+err.Error())
+			talkLock.Unlock()
+			continue
+		}
+		err = fullWrite(outF, header)
+		if err != nil {
+			outF.Close()
+			os.Remove(outName)
+			r.chunkT <- struct{}{}
+			talkLock.Lock()
+			fmt.Fprintln(os.Stderr, "error writing header to failed out file "+outName+":"+err.Error())
+			talkLock.Unlock()
+			continue
+		}
+		_, err = r.tempCarSend.Seek(offset, 0)
+		if err != nil {
+			outF.Close()
+			os.Remove(outName)
+			r.chunkT <- struct{}{}
+			talkLock.Lock()
+			fmt.Fprintln(os.Stderr, "error seeking car to failed out file "+outName+":"+err.Error())
+			talkLock.Unlock()
+			continue
+		}
+		_, err = outF.ReadFrom(r.tempCarSend)
+		outF.Close()
+		if err != nil {
+			os.Remove(outName)
+			r.chunkT <- struct{}{}
+			talkLock.Lock()
+			fmt.Fprintln(os.Stderr, "error copying buffer to "+outName+":"+err.Error())
+			talkLock.Unlock()
+			continue
 		}
 		r.chunkT <- struct{}{}
 	}
 }
 
-func (r *recursiveTraverser) send(job sendJobs) error {
-	if job.offset == carMaxSize || len(job.roots) == 0 {
-		// Empty car do nothing.
-		return nil
-	}
-
+func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error) {
 	cidsToLink := make([]*pb.PBLink, len(job.roots))
 	var nameCounter uint64
 	for _, v := range job.roots {
@@ -297,7 +395,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 				Data:  directoryData,
 			})
 			if err != nil {
-				return fmt.Errorf("serialising fake root: %e", err)
+				return nil, 0, fmt.Errorf("serialising fake root: %e", err)
 			}
 			lastAttempt = median
 
@@ -321,7 +419,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 					Data:  directoryData,
 				})
 				if err != nil {
-					return fmt.Errorf("serialising fake root: %e", err)
+					return nil, 0, fmt.Errorf("serialising fake root: %e", err)
 				}
 			}
 		}
@@ -340,7 +438,7 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 		h := sha256.Sum256(blockData)
 		mhash, err := mh.Encode(h[:], mh.SHA2_256)
 		if err != nil {
-			return fmt.Errorf("encoding multihash: %e", err)
+			return nil, 0, fmt.Errorf("encoding multihash: %e", err)
 		}
 		c := cid.NewCidV1(cid.DagProtobuf, mhash)
 		data = append(append(append(varuintHeader, c.Bytes()...), blockData...), data...)
@@ -353,36 +451,26 @@ func (r *recursiveTraverser) send(job sendJobs) error {
 		nameCounter++
 	}
 
-	var buff io.Reader
 	// Writing CAR header
-	{
-		c, err := cid.Cast(cidsToLink[0].Hash)
-		if err != nil {
-			return fmt.Errorf("casting CID back from bytes: %e", err)
-		}
-		headerBuffer, err := cbor.DumpObject(&car.CarHeader{
-			Roots:   []cid.Cid{c},
-			Version: 1,
-		})
-		if err != nil {
-			return fmt.Errorf("serialising header: %e", err)
-		}
-
-		varuintHeader := make([]byte, binary.MaxVarintLen64+uint64(len(headerBuffer))+uint64(len(data)))
-		uvarintSize := binary.PutUvarint(varuintHeader, uint64(len(headerBuffer)))
-		buff = bytes.NewReader(append(append(varuintHeader[:uvarintSize], headerBuffer...), data...))
+	c, err := cid.Cast(cidsToLink[0].Hash)
+	if err != nil {
+		return nil, 0, fmt.Errorf("casting CID back from bytes: %e", err)
+	}
+	headerBuffer, err := cbor.DumpObject(&car.CarHeader{
+		Roots:   []cid.Cid{c},
+		Version: 1,
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("serialising header: %e", err)
 	}
 
-	// copying tempCar to out
-	err := r.tempCarSend.Sync()
-	if err != nil {
-		return fmt.Errorf("syncing temp file: %e", err)
-	}
-	_, err = r.tempCarSend.Seek(job.offset, 0)
-	if err != nil {
-		return fmt.Errorf("seeking temp file: %e", err)
-	}
-	req, err := http.NewRequest("POST", r.estuaryShuttle, io.MultiReader(buff, r.tempCarSend))
+	varuintHeader := make([]byte, binary.MaxVarintLen64+uint64(len(headerBuffer))+uint64(len(data)))
+	uvarintSize := binary.PutUvarint(varuintHeader, uint64(len(headerBuffer)))
+	return append(append(varuintHeader[:uvarintSize], headerBuffer...), data...), job.offset, nil
+}
+
+func (r *recursiveTraverser) send(car io.Reader) error {
+	req, err := http.NewRequest("POST", r.estuaryShuttle, car)
 	if err != nil {
 		return fmt.Errorf("creating the request failed: %e", err)
 	}
@@ -456,6 +544,9 @@ type recursiveTraverser struct {
 	estuaryShuttle string
 
 	toSend []*cidSizePair
+
+	makeFailedOutDir sync.Once
+	failedOutCounter uint32
 
 	olds struct {
 		Cids       map[string]*savedCidsPairs `json:"cids,omitempty"`
