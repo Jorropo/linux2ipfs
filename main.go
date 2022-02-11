@@ -28,38 +28,31 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const defaultBlockTarget = 1024 * 1024 * 2                  // 2 MiB
-const defaultCarMaxSize = 32*1024*1024*1024 - 1024*1024*128 // ~32 GiB
-const defaultInlineLimit = 32
-const tempFileNamePattern = ".temp.%s.car"
-const envKeyKey = "ESTUARY_KEY"
-const envShuttleKey = "ESTUARY_SHUTTLE"
-const defaultIncrementalFile = "old.json"
-const defaultUploadTries = 3
-const defaultUploadFailedOut = "failed"
+const (
+	defaultBlockTarget     = 1024 * 1024 * 2                   // 2 MiB
+	defaultCarMaxSize      = 32*1024*1024*1024 - 1024*1024*128 // ~32 GiB
+	defaultInlineLimit     = 32
+	tempFileNamePattern    = ".temp.%s.car"
+	envKeyKey              = "ESTUARY_KEY"
+	envShuttleKey          = "ESTUARY_SHUTTLE"
+	defaultIncrementalFile = "old.json"
+	defaultUploadTries     = 3
+	defaultUploadFailedOut = "failed"
+	diskAssumedBlockSize   = 4096
+)
 
 var talkLock sync.Mutex
 
-var rawleafCIDLength int
-var dagPBCIDLength int
-var directoryData []byte
+// Precomputed values
+const (
+	rawleafCIDLength = 36
+	dagPBCIDLength   = 36
+)
+
+// Precomputed value
+var directoryData = []byte{0x08, 0x01}
 
 func init() {
-	h, err := mh.Encode(make([]byte, 32), mh.SHA2_256)
-	if err != nil {
-		panic(err)
-	}
-	rawleafCIDLength = len(cid.NewCidV1(cid.Raw, h).Bytes())
-	dagPBCIDLength = len(cid.NewCidV1(cid.DagProtobuf, h).Bytes())
-
-	typ := pb.UnixfsData_Directory
-	directoryData, err = proto.Marshal(&pb.UnixfsData{
-		Type: &typ,
-	})
-	if err != nil {
-		panic(err)
-	}
-
 	flag.Usage = func() {
 		o := flag.CommandLine.Output()
 		fmt.Fprint(o, "Usage for: "+os.Args[0]+` <target file path>
