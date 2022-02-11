@@ -991,7 +991,7 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 		}
 
 		carBlockTarget := carOffset + blockHeaderSize
-		err = r.writeToBackBuffer(f, &fileOffset, &carBlockTarget, int(workSize))
+		err = r.writeToBackBuffer(f, fileOffset, carBlockTarget, int(workSize))
 		if err != nil {
 			return fmt.Errorf("copying \"%s\" to back buffer: %e", task, err)
 		}
@@ -1024,7 +1024,7 @@ func (r *recursiveTraverser) mayTakeOffset(size int64) (int64, bool) {
 	return r.tempCarOffset, false
 }
 
-func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff *int64, woff *int64, l int) error {
+func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff int64, woff int64, l int) error {
 	rsc, err := read.SyscallConn()
 	if err != nil {
 		return fmt.Errorf("openning SyscallConn of read: %e", err)
@@ -1038,7 +1038,7 @@ func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff *int64, woff 
 		}
 		err = wsc.Control(func(wfd uintptr) {
 			for l != 0 {
-				n, err := unix.CopyFileRange(int(rfd), roff, int(wfd), woff, l, 0)
+				n, err := unix.CopyFileRange(int(rfd), &roff, int(wfd), &woff, l, 0)
 				if err != nil {
 					if err == io.EOF {
 						errr = err
