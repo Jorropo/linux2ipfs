@@ -39,15 +39,17 @@ const (
 	defaultUploadTries     = 3
 	defaultUploadFailedOut = "failed"
 	diskAssumedBlockSize   = 4096
+
+	// Precomputed values
+	rawleafCIDLength = 36
+	dagPBCIDLength   = 36
+
+	fakeBlockCIDOverheadLength = rawleafCIDLength
+	fakeBlockOverheadLength    = 2 /* First full length header */ + fakeBlockCIDOverheadLength
+	fakeBlockMaxValue          = 127 /* first byte varuint max length */ + (127 << 7) + 2 /* the length of the varuint */
 )
 
 var talkLock sync.Mutex
-
-// Precomputed values
-const (
-	rawleafCIDLength = 36
-	dagPBCIDLength   = 36
-)
 
 // Precomputed value
 var directoryData = []byte{0x08, 0x01}
@@ -756,8 +758,6 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 		} else {
 			blockCount := (size-1)/blockTarget + 1
-			chunkSize := size / blockCount
-			reminder := size - (chunkSize * blockCount)
 			CIDs := make([]*cidSizePair, blockCount)
 			manager := &concurrentChunkerManager{
 				concurrentChunkerCount: r.concurrentChunkerCount,
@@ -769,9 +769,10 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 			var fileOffset int64
 			for i := int64(0); i != blockCount; i++ {
-				workSize := chunkSize
-				if i < reminder {
-					workSize++
+				workSize := blockTarget
+				if remaining := size - (i * blockTarget); remaining < workSize {
+					// Last block
+					workSize = remaining
 				}
 
 				varuintHeader := make([]byte, binary.MaxVarintLen64+rawleafCIDLength)
@@ -780,6 +781,13 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 				blockHeaderSize := uvarintSize + rawleafCIDLength
 				fullSize := int64(blockHeaderSize) + workSize
+
+				toPad := uint64(r.tempCarOffset) % diskAssumedBlockSize
+				if toPad != 0 && toPad < fakeBlockOverheadLength {
+					// we can't pad so little, pad to the next size
+					toPad += diskAssumedBlockSize
+				}
+				fullSize += int64(toPad)
 
 				carOffset, needSwap := r.mayTakeOffset(fullSize)
 
@@ -796,6 +804,8 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 					}
 					manager.populate()
 					oldOffset = carMaxSize
+					fullSize -= int64(toPad)
+					toPad = 0
 					r.tempCarOffset -= fullSize
 					carOffset = r.tempCarOffset
 				}
@@ -804,7 +814,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				if err != nil {
 					return nil, false, err
 				}
-				go r.mkChunk(manager, f, task, &CIDs[i], varuintHeader, int64(blockHeaderSize), workSize, carOffset, fileOffset)
+				go r.mkChunk(manager, f, task, &CIDs[i], varuintHeader, int64(blockHeaderSize), workSize, carOffset, fileOffset, uint16(toPad))
 				fileOffset += workSize
 			}
 
@@ -959,7 +969,7 @@ func (m *concurrentChunkerManager) handleChunkerChanError(err error) error {
 	return multierr.Combine(errs...)
 }
 
-func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.File, task string, cidR **cidSizePair, varuintHeader []byte, blockHeaderSize, workSize, carOffset, fileOffset int64) {
+func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.File, task string, cidR **cidSizePair, varuintHeader []byte, blockHeaderSize, workSize, carOffset, fileOffset int64, toPad uint16) {
 	err := func() error {
 		buff := make([]byte, workSize)
 		err := fullReadAt(f, buff, fileOffset)
@@ -987,6 +997,29 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 		err = r.writeToBackBuffer(f, fileOffset, carBlockTarget, int(workSize))
 		if err != nil {
 			return fmt.Errorf("copying \"%s\" to back buffer: %e", task, err)
+		}
+
+		// Padding
+		if toPad != 0 {
+			if toPad < fakeBlockOverheadLength || toPad > fakeBlockMaxValue {
+				panic("internal bug!")
+			}
+
+			buff := make([]byte, fakeBlockOverheadLength)
+			headerBuffer := toPad - (fakeBlockOverheadLength - fakeBlockCIDOverheadLength)
+			buff[0] = uint8(headerBuffer&127) | 0x80 // Low byte
+			buff[1] = uint8(headerBuffer >> 7)       // High byte
+			buff[2] = 1                              // CIDv1
+			buff[3] = 0x55                           // Raw multicodec
+			buff[4] = 0x12                           // sha256 multihash
+			buff[5] = 32                             // Multihash length
+
+			buff = append(buff[:6], precomputedEmptyHashes[toPad-fakeBlockOverheadLength][:]...)
+
+			err = fullWriteAt(r.tempCarChunk, buff, carBlockTarget+workSize)
+			if err != nil {
+				return fmt.Errorf("writing padding: %e", err)
+			}
 		}
 		return nil
 	}()
