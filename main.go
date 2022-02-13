@@ -782,7 +782,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				blockHeaderSize := uvarintSize + rawleafCIDLength
 				fullSize := int64(blockHeaderSize) + workSize
 
-				toPad := uint64(r.tempCarOffset) % diskAssumedBlockSize
+				toPad := (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
 				if toPad != 0 && toPad < fakeBlockOverheadLength {
 					// we can't pad so little, pad to the next size
 					toPad += diskAssumedBlockSize
