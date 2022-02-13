@@ -780,14 +780,14 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				varuintHeader = varuintHeader[:uvarintSize]
 
 				blockHeaderSize := uvarintSize + rawleafCIDLength
-				fullSize := int64(blockHeaderSize) + workSize
+				dataSize := int64(blockHeaderSize) + workSize
 
 				toPad := (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
 				if toPad != 0 && toPad < fakeBlockOverheadLength {
 					// we can't pad so little, pad to the next size
 					toPad += diskAssumedBlockSize
 				}
-				fullSize += int64(toPad)
+				fullSize := int64(toPad) + dataSize
 
 				carOffset, needSwap := r.mayTakeOffset(fullSize)
 
@@ -803,9 +803,13 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						return nil, false, fmt.Errorf("swapping: %e", err)
 					}
 					manager.populate()
-					oldOffset = carMaxSize
-					fullSize -= int64(toPad)
-					toPad = 0
+					oldOffset = r.tempCarOffset
+					toPad = (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
+					if toPad != 0 && toPad < fakeBlockOverheadLength {
+						// we can't pad so little, pad to the next size
+						toPad += diskAssumedBlockSize
+					}
+					fullSize = int64(toPad) + dataSize
 					r.tempCarOffset -= fullSize
 					carOffset = r.tempCarOffset
 				}
