@@ -82,6 +82,7 @@ var carMaxSize int64
 var inlineLimit int64
 var uploadTries uint
 var uploadFailedOut string
+var noPad bool
 
 func mainRet() int {
 	var incrementalFile string
@@ -97,6 +98,7 @@ func mainRet() int {
 		flag.Int64Var(&concurrentChunkers, "concurrent-chunkers", 0, "Number of chunkers to concurrently run, 0 == Num CPUs (note, this only works intra file, the discovery loop is still single threaded).")
 		flag.UintVar(&uploadTries, "max-upload-attempt", defaultUploadTries, "Number of time to try to upload the resulting cars.")
 		flag.StringVar(&uploadFailedOut, "failed-outs", defaultUploadFailedOut, "Where to move failed upload car files in case an upload failed too many times.")
+		flag.BoolVar(&noPad, "no-pad", false, "Doesn't pad the data chunks in the output car to "+strconv.FormatUint(diskAssumedBlockSize, 10)+" bytes, make marginally smaller output cars however likely NOT produce reflinked data.")
 		flag.Parse()
 
 		bad := false
@@ -781,13 +783,17 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 				blockHeaderSize := uvarintSize + rawleafCIDLength
 				dataSize := int64(blockHeaderSize) + workSize
+				fullSize := dataSize
 
-				toPad := (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
-				if toPad != 0 && toPad < fakeBlockOverheadLength {
-					// we can't pad so little, pad to the next size
-					toPad += diskAssumedBlockSize
+				var toPad uint64
+				if !noPad {
+					toPad = (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
+					if toPad != 0 && toPad < fakeBlockOverheadLength {
+						// we can't pad so little, pad to the next size
+						toPad += diskAssumedBlockSize
+					}
 				}
-				fullSize := int64(toPad) + dataSize
+				fullSize += int64(toPad)
 
 				carOffset, needSwap := r.mayTakeOffset(fullSize)
 
@@ -804,12 +810,14 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 					}
 					manager.populate()
 					oldOffset = r.tempCarOffset
-					toPad = (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
-					if toPad != 0 && toPad < fakeBlockOverheadLength {
-						// we can't pad so little, pad to the next size
-						toPad += diskAssumedBlockSize
+					if !noPad {
+						toPad = (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
+						if toPad != 0 && toPad < fakeBlockOverheadLength {
+							// we can't pad so little, pad to the next size
+							toPad += diskAssumedBlockSize
+						}
+						fullSize = int64(toPad) + dataSize
 					}
-					fullSize = int64(toPad) + dataSize
 					r.tempCarOffset -= fullSize
 					carOffset = r.tempCarOffset
 				}
