@@ -46,7 +46,7 @@ const (
 
 	fakeBlockCIDOverheadLength = rawleafCIDLength
 	fakeBlockOverheadLength    = 2 /* First full length header */ + fakeBlockCIDOverheadLength
-	fakeBlockMaxValue          = 127 /* first byte varuint max length */ + (127 << 7) + 2 /* the length of the varuint */
+	fakeBlockMaxValue          = uint(len(precomputedEmptyHashes))
 )
 
 var talkLock sync.Mutex
@@ -1001,7 +1001,7 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 
 		// Padding
 		if toPad != 0 {
-			if toPad < fakeBlockOverheadLength || toPad > fakeBlockMaxValue {
+			if toPad < fakeBlockOverheadLength || uint(toPad) > fakeBlockMaxValue {
 				panic("internal bug!")
 			}
 
