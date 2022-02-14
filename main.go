@@ -291,11 +291,7 @@ type driverCreator struct {
 }
 
 var drivers = map[string]driverCreator{
-	"estuary": {
-		factory:    newEstuaryDriver,
-		help:       estuaryHelp,
-		maxCarSize: 32*1024*1024*1024 - 1024*1024*128, // ~32 GiB
-	},
+	"estuary": estuaryDriverCreator,
 }
 
 func (r *recursiveTraverser) sendWorker() {

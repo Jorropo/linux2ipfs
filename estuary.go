@@ -13,6 +13,12 @@ const (
 	envEstuaryShuttleKey = "ESTUARY_SHUTTLE"
 )
 
+var estuaryDriverCreator = driverCreator{
+	factory:    newEstuaryDriver,
+	help:       estuaryHelp,
+	maxCarSize: 32*1024*1024*1024 - 1024*1024*128, // ~32 GiB
+}
+
 func estuaryHelp(out io.Writer) {
 	fmt.Fprint(out, `  Environ:
   - `+envEstuaryKeyKey+` estuary API key
