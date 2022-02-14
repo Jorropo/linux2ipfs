@@ -59,5 +59,5 @@ That easy to explain why, most of it is because `go-car` actually copies the fil
 $ btrfs fi du *
      Total   Exclusive  Set shared  Filename
   31.92GiB    31.92GiB       0.00B  car.car
-  31.91GiB       0.00B    31.91GiB  f
+  31.91GiB    31.91GiB       0.00B  f
 ```
