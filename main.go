@@ -1,17 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,12 +28,9 @@ import (
 )
 
 const (
-	defaultBlockTarget     = 1024 * 1024 * 2                   // 2 MiB
-	defaultCarMaxSize      = 32*1024*1024*1024 - 1024*1024*128 // ~32 GiB
+	defaultBlockTarget     = 1024 * 1024 * 2 // 2 MiB
 	defaultInlineLimit     = 32
 	tempFileNamePattern    = ".temp.%s.car"
-	envKeyKey              = "ESTUARY_KEY"
-	envShuttleKey          = "ESTUARY_SHUTTLE"
 	defaultIncrementalFile = "old.json"
 	defaultUploadTries     = 3
 	defaultUploadFailedOut = "failed"
@@ -57,19 +53,19 @@ var directoryData = []byte{0x08, 0x01}
 func init() {
 	flag.Usage = func() {
 		o := flag.CommandLine.Output()
-		fmt.Fprint(o, "Usage for: "+os.Args[0]+` <target file path>
-
-Environ:
-  - `+envKeyKey+` estuary API key REQUIRED
-  - `+envShuttleKey+` shuttle domain REQUIRED
-
-Positional:
+		fmt.Fprint(o, "Usage for: "+os.Args[0]+" <target file path>\n\n")
+		fmt.Fprint(o, "Drivers:")
+		for n, d := range drivers {
+			fmt.Fprint(o, "- "+n+":\n")
+			d.help(o)
+		}
+		fmt.Fprint(o, `Positional:
   <target file path> REQUIRED
 
 Flags:
 `)
 		flag.PrintDefaults()
-		fmt.Fprintln(o, "Sample:\n  "+envKeyKey+"=EST...ARY "+envShuttleKey+"=shuttle-4.estuary.tech "+os.Args[0]+" fileToUpload/")
+		fmt.Fprintln(o, "Sample:\n  "+envEstuaryKeyKey+"=EST...ARY "+envEstuaryShuttleKey+"=shuttle-4.estuary.tech "+os.Args[0]+" fileToUpload/")
 	}
 }
 
@@ -88,28 +84,25 @@ func mainRet() int {
 	var incrementalFile string
 	var target string
 	var concurrentChunkers int64
-	estuaryKey := os.Getenv(envKeyKey)
-	estuaryShuttle := os.Getenv(envShuttleKey)
+	var driverToUse driver
 	{
+		var driverTarget string
 		flag.Int64Var(&blockTarget, "block-target", defaultBlockTarget, "Maximum size of blocks.")
-		flag.Int64Var(&carMaxSize, "car-size", defaultCarMaxSize, "Car reset point, this is mostly how big you want your CARs to be, but it actually is at which point does it stop adding more blocks to it, there is often a 1~128MiB more data to sent (the fakeroots and the header).")
+		flag.Int64Var(&carMaxSize, "car-size", 0, "Car reset point, this is mostly how big you want your CARs to be, but it actually is at which point does it stop adding more blocks to it, there is often a 1~128MiB more data to sent (the fakeroots and the header), 0 defaults to the driver default.")
 		flag.Int64Var(&inlineLimit, "inline-limit", defaultInlineLimit, "The maximum size at which to attempt to inline blocks.")
 		flag.StringVar(&incrementalFile, "incremental-file", defaultIncrementalFile, "Path to the file which stores the old CIDs and old update time.")
 		flag.Int64Var(&concurrentChunkers, "concurrent-chunkers", 0, "Number of chunkers to concurrently run, 0 == Num CPUs (note, this only works intra file, the discovery loop is still single threaded).")
 		flag.UintVar(&uploadTries, "max-upload-attempt", defaultUploadTries, "Number of time to try to upload the resulting cars.")
 		flag.StringVar(&uploadFailedOut, "failed-outs", defaultUploadFailedOut, "Where to move failed upload car files in case an upload failed too many times.")
 		flag.BoolVar(&noPad, "no-pad", false, "Doesn't pad the data chunks in the output car to "+strconv.FormatUint(diskAssumedBlockSize, 10)+" bytes, make marginally smaller output cars however likely NOT produce reflinked data.")
+		flag.StringVar(&driverTarget, "driver", "estuary", "Driver selector.")
 		flag.Parse()
 
 		bad := false
 
-		if estuaryKey == "" {
-			fmt.Fprintln(os.Stderr, "error empty "+envKeyKey+" envKey")
-			bad = bad || true
-		}
-		if estuaryShuttle == "" {
-			fmt.Fprintln(os.Stderr, "error empty "+envShuttleKey+" envKey")
-			bad = bad || true
+		driversAndOptions := strings.SplitN(driverTarget, "-", 2)
+		if len(driversAndOptions) == 1 {
+			driversAndOptions = append(driversAndOptions, "")
 		}
 
 		if blockTarget < 1024 {
@@ -120,9 +113,30 @@ func mainRet() int {
 			fmt.Fprintln(os.Stderr, "error block-target cannot be bigger than 2MiB")
 			bad = bad || true
 		}
-		if carMaxSize < blockTarget {
-			fmt.Fprintln(os.Stderr, "error car-size cannot be smaller than block-target")
+
+		var ok bool
+		driv, ok := drivers[driversAndOptions[0]]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "error driver: %q not found\n", driverTarget)
 			bad = bad || true
+		} else {
+			var err error
+			driverToUse, err = driv.factory(driversAndOptions[1])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error creating driver: "+err.Error())
+				bad = bad || true
+			}
+
+			if carMaxSize == 0 {
+				carMaxSize = driv.maxCarSize
+			} else if carMaxSize > driv.maxCarSize {
+				fmt.Fprintln(os.Stderr, "error car-size cannot be smaller than block-target")
+				bad = bad || true
+			}
+			if carMaxSize < blockTarget {
+				fmt.Fprintln(os.Stderr, "error car-size cannot be smaller than block-target")
+				bad = bad || true
+			}
 		}
 		if inlineLimit < 0 {
 			fmt.Fprintln(os.Stderr, "error inline-limit cannot be negative")
@@ -192,8 +206,7 @@ func mainRet() int {
 		sendT:                  make(chan sendJobs, 1),
 		sendOver:               make(chan struct{}),
 		concurrentChunkerCount: concurrentChunkers,
-		estuaryKey:             estuaryKey,
-		estuaryShuttle:         "https://" + estuaryShuttle + "/content/add-car",
+		send:                   driverToUse,
 	}
 	go r.sendWorker()
 	r.chunkT <- struct{}{}
@@ -267,6 +280,24 @@ func mainRet() int {
 	return 0
 }
 
+type driver func(headerBuffer []byte, car *os.File, carOffset int64) error
+type driverFactory func(params string) (driver, error)
+type driverHelper func(output io.Writer)
+
+type driverCreator struct {
+	factory    driverFactory
+	help       driverHelper
+	maxCarSize int64
+}
+
+var drivers = map[string]driverCreator{
+	"estuary": {
+		factory:    newEstuaryDriver,
+		help:       estuaryHelp,
+		maxCarSize: 32*1024*1024*1024 - 1024*1024*128, // ~32 GiB
+	},
+}
+
 func (r *recursiveTraverser) sendWorker() {
 	defer close(r.sendOver)
 TaskLoop:
@@ -288,15 +319,7 @@ TaskLoop:
 		}
 		for failed := uint(0); failed != uploadTries; failed++ {
 			attemptCount := strconv.FormatUint(uint64(failed), 10) + " / " + strconv.FormatUint(uint64(uploadTries), 10)
-			_, err = r.tempCarSend.Seek(offset, 0)
-			if err != nil {
-				talkLock.Lock()
-				fmt.Fprintln(os.Stderr, "error seeking temp file: "+err.Error())
-				talkLock.Unlock()
-				continue
-			}
-
-			err := r.send(io.MultiReader(bytes.NewReader(header), r.tempCarSend))
+			err := r.send(header, r.tempCarSend, offset)
 			if err != nil {
 				talkLock.Lock()
 				fmt.Fprintln(os.Stderr, attemptCount+" error sending: "+err.Error())
@@ -466,28 +489,6 @@ func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error
 	return append(append(varuintHeader[:uvarintSize], headerBuffer...), data...), job.offset, nil
 }
 
-func (r *recursiveTraverser) send(car io.Reader) error {
-	req, err := http.NewRequest("POST", r.estuaryShuttle, car)
-	if err != nil {
-		return fmt.Errorf("creating the request failed: %e", err)
-	}
-
-	req.Header.Set("Content-Type", "application/car")
-	req.Header.Set("Authorization", "Bearer "+r.estuaryKey)
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("posting failed: %e", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("non 200 result code: %d / body: %s", resp.StatusCode, string(b))
-	}
-
-	return nil
-}
-
 func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, bool, error) {
 	// Making block header
 	varuintHeader := make([]byte, binary.MaxVarintLen64+dagPBCIDLength+len(data))
@@ -535,10 +536,9 @@ type recursiveTraverser struct {
 	sendT    chan sendJobs
 	sendOver chan struct{}
 
-	concurrentChunkerCount int64
+	send driver
 
-	estuaryKey     string
-	estuaryShuttle string
+	concurrentChunkerCount int64
 
 	toSend []*cidSizePair
 
@@ -549,8 +549,6 @@ type recursiveTraverser struct {
 		Cids       map[string]*savedCidsPairs `json:"cids,omitempty"`
 		LastUpdate time.Time                  `json:"lastUpdate,omitempty"`
 	}
-
-	client http.Client
 }
 
 type savedCidsPairs struct {
