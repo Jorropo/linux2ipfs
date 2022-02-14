@@ -332,10 +332,7 @@ TaskLoop:
 
 		// Failed, copy to failedOut
 		r.makeFailedOutDir.Do(func() {
-			err := os.Mkdir(uploadFailedOut, 0o775)
-			if err != nil {
-				panic("failed to create uploadFailedOut directory: " + err.Error())
-			}
+			os.Mkdir(uploadFailedOut, 0o775)
 		})
 
 		n := atomic.AddUint32(&r.failedOutCounter, 1)
