@@ -54,7 +54,7 @@ func init() {
 	flag.Usage = func() {
 		o := flag.CommandLine.Output()
 		fmt.Fprint(o, "Usage for: "+os.Args[0]+" <target file path>\n\n")
-		fmt.Fprint(o, "Drivers:")
+		fmt.Fprint(o, "Drivers:\n")
 		for n, d := range drivers {
 			fmt.Fprint(o, "- "+n+":\n")
 			d.help(o)
@@ -123,7 +123,7 @@ func mainRet() int {
 			var err error
 			driverToUse, err = driv.factory(driversAndOptions[1])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "error creating driver: "+err.Error())
+				fmt.Fprint(os.Stderr, "error creating driver: "+err.Error()+"\n")
 				bad = bad || true
 			}
 
@@ -292,6 +292,7 @@ type driverCreator struct {
 
 var drivers = map[string]driverCreator{
 	"estuary": estuaryDriverCreator,
+	"car":     carDriverCreator,
 }
 
 func (r *recursiveTraverser) sendWorker() {
@@ -1008,16 +1009,7 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 				panic("internal bug!")
 			}
 
-			buff := make([]byte, fakeBlockOverheadLength)
-			headerBuffer := toPad - (fakeBlockOverheadLength - fakeBlockCIDOverheadLength)
-			buff[0] = uint8(headerBuffer&127) | 0x80 // Low byte
-			buff[1] = uint8(headerBuffer >> 7)       // High byte
-			buff[2] = 1                              // CIDv1
-			buff[3] = 0x55                           // Raw multicodec
-			buff[4] = 0x12                           // sha256 multihash
-			buff[5] = 32                             // Multihash length
-
-			buff = append(buff[:6], precomputedEmptyHashes[toPad-fakeBlockOverheadLength][:]...)
+			buff := createPadBlockHeader(toPad)
 
 			err = fullWriteAt(r.tempCarChunk, buff, carBlockTarget+workSize)
 			if err != nil {
@@ -1031,6 +1023,19 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 	} else {
 		manager.t <- struct{}{}
 	}
+}
+
+func createPadBlockHeader(toPad uint16) []byte {
+	buff := make([]byte, fakeBlockOverheadLength)
+	headerBuffer := toPad - (fakeBlockOverheadLength - fakeBlockCIDOverheadLength)
+	buff[0] = uint8(headerBuffer&127) | 0x80 // Low byte
+	buff[1] = uint8(headerBuffer >> 7)       // High byte
+	buff[2] = 1                              // CIDv1
+	buff[3] = 0x55                           // Raw multicodec
+	buff[4] = 0x12                           // sha256 multihash
+	buff[5] = 32                             // Multihash length
+
+	return append(buff[:6], precomputedEmptyHashes[toPad-fakeBlockOverheadLength][:]...)
 }
 
 func (r *recursiveTraverser) takeOffset(size int64) (int64, bool, error) {
