@@ -318,7 +318,7 @@ TaskLoop:
 			continue
 		}
 		for failed := uint(0); failed != uploadTries; failed++ {
-			attemptCount := strconv.FormatUint(uint64(failed), 10) + " / " + strconv.FormatUint(uint64(uploadTries), 10)
+			attemptCount := strconv.FormatUint(uint64(failed+1), 10) + " / " + strconv.FormatUint(uint64(uploadTries), 10)
 			err := r.send(header, r.tempCarSend, offset)
 			if err != nil {
 				talkLock.Lock()
