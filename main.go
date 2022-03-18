@@ -305,7 +305,7 @@ TaskLoop:
 		}
 		header, offset, err := r.makeSendPayload(task)
 		if err != nil {
-			panic(fmt.Errorf("creating payload: %e", err))
+			panic(fmt.Errorf("creating payload: %w", err))
 		}
 		err = r.tempCarSend.Sync()
 		if err != nil {
@@ -409,7 +409,7 @@ func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error
 				Data:  directoryData,
 			})
 			if err != nil {
-				return nil, 0, fmt.Errorf("serialising fake root: %e", err)
+				return nil, 0, fmt.Errorf("serialising fake root: %w", err)
 			}
 			lastAttempt = median
 
@@ -433,7 +433,7 @@ func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error
 					Data:  directoryData,
 				})
 				if err != nil {
-					return nil, 0, fmt.Errorf("serialising fake root: %e", err)
+					return nil, 0, fmt.Errorf("serialising fake root: %w", err)
 				}
 			}
 		}
@@ -452,7 +452,7 @@ func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error
 		h := sha256.Sum256(blockData)
 		mhash, err := mh.Encode(h[:], mh.SHA2_256)
 		if err != nil {
-			return nil, 0, fmt.Errorf("encoding multihash: %e", err)
+			return nil, 0, fmt.Errorf("encoding multihash: %w", err)
 		}
 		c := cid.NewCidV1(cid.DagProtobuf, mhash)
 		data = append(append(append(varuintHeader, c.Bytes()...), blockData...), data...)
@@ -468,14 +468,14 @@ func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error
 	// Writing CAR header
 	c, err := cid.Cast(cidsToLink[0].Hash)
 	if err != nil {
-		return nil, 0, fmt.Errorf("casting CID back from bytes: %e", err)
+		return nil, 0, fmt.Errorf("casting CID back from bytes: %w", err)
 	}
 	headerBuffer, err := cbor.DumpObject(&car.CarHeader{
 		Roots:   []cid.Cid{c},
 		Version: 1,
 	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("serialising header: %e", err)
+		return nil, 0, fmt.Errorf("serialising header: %w", err)
 	}
 
 	varuintHeader := make([]byte, binary.MaxVarintLen64+uint64(len(headerBuffer))+uint64(len(data)))
@@ -494,7 +494,7 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, bool, error) {
 	h := sha256.Sum256(data)
 	mhash, err := mh.Encode(h[:], mh.SHA2_256)
 	if err != nil {
-		return cid.Cid{}, false, fmt.Errorf("encoding multihash: %e", err)
+		return cid.Cid{}, false, fmt.Errorf("encoding multihash: %w", err)
 	}
 	fakeLeaf := cid.NewCidV1(cid.Raw, mhash)
 	rootBlock := append(append(varuintHeader, fakeLeaf.Bytes()...), data...)
@@ -506,11 +506,11 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, bool, error) {
 
 	off, swapped, err := r.takeOffset(fullSize)
 	if err != nil {
-		return cid.Cid{}, false, fmt.Errorf("taking offset: %e", err)
+		return cid.Cid{}, false, fmt.Errorf("taking offset: %w", err)
 	}
 	err = fullWriteAt(r.tempCarChunk, rootBlock, off)
 	if err != nil {
-		return cid.Cid{}, false, fmt.Errorf("writing root's header: %e", err)
+		return cid.Cid{}, false, fmt.Errorf("writing root's header: %w", err)
 	}
 
 	return cid.NewCidV1(cid.DagProtobuf, mhash), swapped, nil
@@ -574,7 +574,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			// Recover old link
 			c, err := cid.Decode(old.Cid)
 			if err != nil {
-				return nil, false, fmt.Errorf("decoding old cid \"%s\": %e", old.Cid, err)
+				return nil, false, fmt.Errorf("decoding old cid \"%s\": %w", old.Cid, err)
 			}
 			return &cidSizePair{
 				Cid:     c,
@@ -584,7 +584,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 		target, err := os.Readlink(task)
 		if err != nil {
-			return nil, false, fmt.Errorf("resolving symlink %s: %e", task, err)
+			return nil, false, fmt.Errorf("resolving symlink %s: %w", task, err)
 		}
 
 		typ := pb.UnixfsData_Symlink
@@ -594,17 +594,17 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			Data: []byte(target),
 		})
 		if err != nil {
-			return nil, false, fmt.Errorf("marshaling unixfs %s: %e\n", task, err)
+			return nil, false, fmt.Errorf("marshaling unixfs %s: %w\n", task, err)
 		}
 
 		data, err = proto.Marshal(&pb.PBNode{Data: data})
 		if err != nil {
-			return nil, false, fmt.Errorf("marshaling ipld %s: %e\n", task, err)
+			return nil, false, fmt.Errorf("marshaling ipld %s: %w\n", task, err)
 		}
 
 		hash, err := mh.Encode(data, mh.IDENTITY)
 		if err != nil {
-			return nil, false, fmt.Errorf("inlining %s: %e", task, err)
+			return nil, false, fmt.Errorf("inlining %s: %w", task, err)
 		}
 
 		c := cid.NewCidV1(cid.DagProtobuf, hash)
@@ -632,7 +632,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 		subThings, err := os.ReadDir(task)
 		if err != nil {
-			return nil, false, fmt.Errorf("ReadDir %s: %e\n", task, err)
+			return nil, false, fmt.Errorf("ReadDir %s: %w\n", task, err)
 		}
 
 		links := make([]*pb.PBLink, len(subThings))
@@ -642,7 +642,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 		for i, v := range subThings {
 			sInfo, err := v.Info()
 			if err != nil {
-				return nil, false, fmt.Errorf("getting info of %s/%s: %e", task, v.Name(), err)
+				return nil, false, fmt.Errorf("getting info of %s/%s: %w", task, v.Name(), err)
 			}
 			sCid, updated, err := r.do(task+"/"+v.Name(), sInfo)
 			new = new || updated
@@ -666,7 +666,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			// Recover old link
 			c, err := cid.Decode(old.Cid)
 			if err != nil {
-				return nil, false, fmt.Errorf("decoding old cid \"%s\": %e", old.Cid, err)
+				return nil, false, fmt.Errorf("decoding old cid \"%s\": %w", old.Cid, err)
 			}
 			return &cidSizePair{
 				Cid:     c,
@@ -679,7 +679,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			Data:  directoryData,
 		})
 		if err != nil {
-			return nil, false, fmt.Errorf("can't Marshal directory %s: %e", task, err)
+			return nil, false, fmt.Errorf("can't Marshal directory %s: %w", task, err)
 		}
 		if int64(len(data)) > blockTarget {
 			return nil, false, fmt.Errorf("%s is exceed block limit, TODO: support sharding directories", task)
@@ -689,7 +689,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 		c, _, err := r.writePBNode(data)
 		if err != nil {
-			return nil, false, fmt.Errorf("writing directory %s: %e", task, err)
+			return nil, false, fmt.Errorf("writing directory %s: %w", task, err)
 		}
 
 		if oldExists {
@@ -715,7 +715,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			// Recover old link
 			c, err := cid.Decode(old.Cid)
 			if err != nil {
-				return nil, false, fmt.Errorf("decoding old cid \"%s\": %e", old.Cid, err)
+				return nil, false, fmt.Errorf("decoding old cid \"%s\": %w", old.Cid, err)
 			}
 			return &cidSizePair{
 				Cid:     c,
@@ -725,7 +725,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 		f, err := os.Open(task)
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to open %s: %e", task, err)
+			return nil, false, fmt.Errorf("failed to open %s: %w", task, err)
 		}
 		defer f.Close()
 
@@ -738,11 +738,11 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			data := make([]byte, size)
 			_, err := io.ReadFull(f, data)
 			if err != nil {
-				return nil, false, fmt.Errorf("reading %s: %e", task, err)
+				return nil, false, fmt.Errorf("reading %s: %w", task, err)
 			}
 			hash, err := mh.Encode(data, mh.IDENTITY)
 			if err != nil {
-				return nil, false, fmt.Errorf("inlining %s: %e", task, err)
+				return nil, false, fmt.Errorf("inlining %s: %w", task, err)
 			}
 			c = &cidSizePair{
 				Cid:      cid.NewCidV1(cid.Raw, hash),
@@ -798,7 +798,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 					sentCounter = i
 					err = r.swap()
 					if err != nil {
-						return nil, false, fmt.Errorf("swapping: %e", err)
+						return nil, false, fmt.Errorf("swapping: %w", err)
 					}
 					manager.populate()
 					oldOffset = r.tempCarOffset
@@ -853,7 +853,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 						lastRoot, fileSum, err = makeFileRoot(CIDs[:median])
 						if err != nil {
-							return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
+							return nil, false, fmt.Errorf("building a root for %s: %w", task, err)
 						}
 						lastAttempt = median
 
@@ -874,7 +874,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						if low != lastAttempt {
 							lastRoot, fileSum, err = makeFileRoot(CIDs[:low])
 							if err != nil {
-								return nil, false, fmt.Errorf("building a root for %s: %e", task, err)
+								return nil, false, fmt.Errorf("building a root for %s: %w", task, err)
 							}
 						}
 					}
@@ -886,7 +886,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 					c, swapped, err := r.writePBNode(lastRoot)
 					if err != nil {
-						return nil, false, fmt.Errorf("writing root for %s: %e", task, err)
+						return nil, false, fmt.Errorf("writing root for %s: %w", task, err)
 					}
 					if swapped {
 						oldOffset = carMaxSize
@@ -978,12 +978,12 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 		buff := make([]byte, workSize)
 		err := fullReadAt(f, buff, fileOffset)
 		if err != nil {
-			return fmt.Errorf("reading file: %e", err)
+			return fmt.Errorf("reading file: %w", err)
 		}
 		hash := sha256.Sum256(buff)
 		mhash, err := mh.Encode(hash[:], mh.SHA2_256)
 		if err != nil {
-			return fmt.Errorf("encoding multihash for %s: %e", task, err)
+			return fmt.Errorf("encoding multihash for %s: %w", task, err)
 		}
 		c := cid.NewCidV1(cid.Raw, mhash)
 		*cidR = &cidSizePair{
@@ -994,13 +994,13 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 
 		err = fullWriteAt(r.tempCarChunk, append(varuintHeader, c.Bytes()...), carOffset)
 		if err != nil {
-			return fmt.Errorf("writing CID + header: %e", err)
+			return fmt.Errorf("writing CID + header: %w", err)
 		}
 
 		carBlockTarget := carOffset + blockHeaderSize
 		err = r.writeToBackBuffer(f, fileOffset, carBlockTarget, int(workSize))
 		if err != nil {
-			return fmt.Errorf("copying \"%s\" to back buffer: %e", task, err)
+			return fmt.Errorf("copying \"%s\" to back buffer: %w", task, err)
 		}
 
 		// Padding
@@ -1013,7 +1013,7 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 
 			err = fullWriteAt(r.tempCarChunk, buff, carBlockTarget+workSize)
 			if err != nil {
-				return fmt.Errorf("writing padding: %e", err)
+				return fmt.Errorf("writing padding: %w", err)
 			}
 		}
 		return nil
@@ -1043,7 +1043,7 @@ func (r *recursiveTraverser) takeOffset(size int64) (int64, bool, error) {
 	if swapped {
 		err := r.swap()
 		if err != nil {
-			return 0, false, fmt.Errorf("failed to pump out: %e", err)
+			return 0, false, fmt.Errorf("failed to pump out: %w", err)
 		}
 	}
 	r.tempCarOffset -= size
@@ -1061,13 +1061,13 @@ func (r *recursiveTraverser) mayTakeOffset(size int64) (int64, bool) {
 func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff int64, woff int64, l int) error {
 	rsc, err := read.SyscallConn()
 	if err != nil {
-		return fmt.Errorf("openning SyscallConn of read: %e", err)
+		return fmt.Errorf("openning SyscallConn of read: %w", err)
 	}
 	var errr error
 	err = rsc.Control(func(rfd uintptr) {
 		wsc, err := r.tempCarChunk.SyscallConn()
 		if err != nil {
-			errr = fmt.Errorf("openning SyscallConn of write: %e", err)
+			errr = fmt.Errorf("openning SyscallConn of write: %w", err)
 			return
 		}
 		err = wsc.Control(func(wfd uintptr) {
@@ -1077,7 +1077,7 @@ func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff int64, woff i
 					if err == io.EOF {
 						errr = err
 					} else {
-						errr = fmt.Errorf("zero-copying to back buffer: %e", err)
+						errr = fmt.Errorf("zero-copying to back buffer: %w", err)
 					}
 					return
 				}
@@ -1085,11 +1085,11 @@ func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff int64, woff i
 			}
 		})
 		if err != nil {
-			errr = fmt.Errorf("getting Control of write: %e", err)
+			errr = fmt.Errorf("getting Control of write: %w", err)
 		}
 	})
 	if err != nil {
-		return fmt.Errorf("getting Control of read: %e", err)
+		return fmt.Errorf("getting Control of read: %w", err)
 	}
 	return errr
 }

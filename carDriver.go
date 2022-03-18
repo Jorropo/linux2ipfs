@@ -39,7 +39,7 @@ type carDriver struct {
 func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) error {
 	_, err := car.Seek(carOffset, 0)
 	if err != nil {
-		return fmt.Errorf("seeking temp file: %e", err)
+		return fmt.Errorf("seeking temp file: %w", err)
 	}
 
 	n := atomic.AddUint32(&c.counter, 1)
@@ -48,20 +48,20 @@ func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) err
 	if err != nil {
 		outF.Close()
 		os.Remove(outName)
-		return fmt.Errorf("creating failed out file %q: %e", outName, err)
+		return fmt.Errorf("creating failed out file %q: %w", outName, err)
 	}
 	headerLen := int64(len(headerBuffer))
 	err = fullWrite(outF, headerBuffer)
 	if err != nil {
 		outF.Close()
 		os.Remove(outName)
-		return fmt.Errorf("writing header to failed out file %q: %e", outName, err)
+		return fmt.Errorf("writing header to failed out file %q: %w", outName, err)
 	}
 	_, err = car.Seek(carOffset, 0)
 	if err != nil {
 		outF.Close()
 		os.Remove(outName)
-		return fmt.Errorf("seeking car to failed out file %q: %e", outName, err)
+		return fmt.Errorf("seeking car to failed out file %q: %w", outName, err)
 	}
 
 	if !noPad {
@@ -76,12 +76,12 @@ func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) err
 
 			err = fullWrite(outF, createPadBlockHeader(padHeader))
 			if err != nil {
-				return fmt.Errorf("writing pad block to %q: %e", outName, err)
+				return fmt.Errorf("writing pad block to %q: %w", outName, err)
 			}
 
 			_, err = outF.Seek(headerLen+int64(padHeader), 0)
 			if err != nil {
-				return fmt.Errorf("seeking after pad block to %q: %e", outName, err)
+				return fmt.Errorf("seeking after pad block to %q: %w", outName, err)
 			}
 		}
 
@@ -92,7 +92,7 @@ func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) err
 				N: int64(padCar),
 			})
 			if err != nil {
-				return fmt.Errorf("precopying the pad car to %q: %e", outName, err)
+				return fmt.Errorf("precopying the pad car to %q: %w", outName, err)
 			}
 		}
 	}
@@ -101,7 +101,7 @@ func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) err
 	outF.Close()
 	if err != nil {
 		os.Remove(outName)
-		return fmt.Errorf("copying buffer to %q: %e", outName, err)
+		return fmt.Errorf("copying buffer to %q: %w", outName, err)
 	}
 
 	return nil

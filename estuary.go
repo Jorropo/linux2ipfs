@@ -59,12 +59,12 @@ type estuaryDriver struct {
 func (e *estuaryDriver) send(headerBuffer []byte, car *os.File, carOffset int64) error {
 	_, err := car.Seek(carOffset, 0)
 	if err != nil {
-		return fmt.Errorf("error seeking temp file: %e", err)
+		return fmt.Errorf("error seeking temp file: %w", err)
 	}
 
 	req, err := http.NewRequest("POST", e.shuttle, io.MultiReader(bytes.NewReader(headerBuffer), car))
 	if err != nil {
-		return fmt.Errorf("creating the request failed: %e", err)
+		return fmt.Errorf("creating the request failed: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/car")
@@ -72,7 +72,7 @@ func (e *estuaryDriver) send(headerBuffer []byte, car *os.File, carOffset int64)
 
 	resp, err := e.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("posting failed: %e", err)
+		return fmt.Errorf("posting failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
