@@ -69,7 +69,7 @@ func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) err
 		padHeader := (diskAssumedBlockSize - padCar - uint16(headerLen)) % diskAssumedBlockSize
 
 		if padHeader != 0 {
-			if padHeader < fakeBlockOverheadLength {
+			if padHeader < fakeBlockMinLength {
 				// we can't pad so little, pad to the next size
 				padHeader += diskAssumedBlockSize
 			}

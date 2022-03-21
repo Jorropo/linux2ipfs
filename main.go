@@ -42,6 +42,7 @@ const (
 
 	fakeBlockCIDOverheadLength = rawleafCIDLength
 	fakeBlockOverheadLength    = 2 /* First full length header */ + fakeBlockCIDOverheadLength
+	fakeBlockMinLength         = 1<<7 /* space to fill up the varuint so we don't run into "varuint non minimal" errors */ + 1
 	fakeBlockMaxValue          = uint(len(precomputedEmptyHashes))
 )
 
@@ -780,7 +781,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				var toPad uint64
 				if !noPad {
 					toPad = (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
-					if toPad != 0 && toPad < fakeBlockOverheadLength {
+					if toPad != 0 && toPad < fakeBlockMinLength {
 						// we can't pad so little, pad to the next size
 						toPad += diskAssumedBlockSize
 					}
@@ -804,7 +805,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 					oldOffset = r.tempCarOffset
 					if !noPad {
 						toPad = (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
-						if toPad != 0 && toPad < fakeBlockOverheadLength {
+						if toPad != 0 && toPad < fakeBlockMinLength {
 							// we can't pad so little, pad to the next size
 							toPad += diskAssumedBlockSize
 						}
@@ -1005,7 +1006,7 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 
 		// Padding
 		if toPad != 0 {
-			if toPad < fakeBlockOverheadLength || uint(toPad) > fakeBlockMaxValue {
+			if toPad < fakeBlockMinLength || uint(toPad) > fakeBlockMaxValue {
 				panic("internal bug!")
 			}
 
