@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -292,6 +293,7 @@ func (r *recursiveTraverser) statWorker(task string) {
 		select {
 		case r.statError <- err:
 		case <-r.statCancel:
+			return
 		}
 	}
 	err = r.rStatWorker(task, entry)
@@ -299,6 +301,7 @@ func (r *recursiveTraverser) statWorker(task string) {
 		select {
 		case r.statError <- err:
 		case <-r.statCancel:
+			return
 		}
 	}
 }
@@ -323,6 +326,7 @@ func (r *recursiveTraverser) rStatWorker(task string, entry os.FileInfo) error {
 	select {
 	case r.statEntries <- job:
 	case <-r.statCancel:
+		return errors.New("stat canceled")
 	}
 
 	if isDir {
