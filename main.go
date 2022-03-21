@@ -788,6 +788,8 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				}
 				fullSize += int64(toPad)
 
+				writePadBlock := r.tempCarOffset != carMaxSize // If that true that mean we are writting the first (so end because we write backward) block, so no need to write padding
+
 				carOffset, needSwap := r.mayTakeOffset(fullSize)
 
 				if needSwap {
@@ -811,8 +813,13 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						}
 						fullSize = int64(toPad) + dataSize
 					}
+					writePadBlock = false
 					r.tempCarOffset -= fullSize
 					carOffset = r.tempCarOffset
+				}
+
+				if !writePadBlock {
+					toPad = 0
 				}
 
 				err := manager.getChunkToken()
