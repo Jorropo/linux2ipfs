@@ -35,6 +35,7 @@ const (
 	defaultUploadTries     = 3
 	defaultUploadFailedOut = "failed"
 	diskAssumedBlockSize   = 4096
+	doJobsBuffer           = 1024 * 16
 
 	// Precomputed values
 	rawleafCIDLength = 36
@@ -203,12 +204,17 @@ func mainRet() int {
 		tempCarChunk:           tempCarA,
 		tempCarSend:            tempCarB,
 		tempCarOffset:          carMaxSize,
+		statEntries:            make(chan *doJobs, doJobsBuffer),
+		statError:              make(chan error),
+		statCancel:             make(chan struct{}),
 		chunkT:                 make(chan struct{}, 1),
 		sendT:                  make(chan sendJobs, 1),
 		sendOver:               make(chan struct{}),
 		concurrentChunkerCount: concurrentChunkers,
 		send:                   driverToUse,
 	}
+	defer r.endStatWorker()
+	go r.statWorker(target)
 	go r.sendWorker()
 	r.chunkT <- struct{}{}
 
@@ -233,12 +239,7 @@ func mainRet() int {
 		r.olds.Cids = map[string]*savedCidsPairs{}
 	}
 
-	entry, err := os.Lstat(target)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error stating "+target+": "+err.Error())
-		return 1
-	}
-	c, updated, err := r.do(target, entry)
+	c, updated, err := r.do()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
 		return 1
@@ -279,6 +280,65 @@ func mainRet() int {
 	<-r.sendOver
 
 	return 0
+}
+
+func (r *recursiveTraverser) endStatWorker() {
+	close(r.statCancel)
+}
+
+func (r *recursiveTraverser) statWorker(task string) {
+	entry, err := os.Lstat(task)
+	if err != nil {
+		select {
+		case r.statError <- err:
+		case <-r.statCancel:
+		}
+	}
+	err = r.rStatWorker(task, entry)
+	if err != nil {
+		select {
+		case r.statError <- err:
+		case <-r.statCancel:
+		}
+	}
+}
+
+func (r *recursiveTraverser) rStatWorker(task string, entry os.FileInfo) error {
+	job := &doJobs{
+		task:  task,
+		entry: entry,
+	}
+
+	isDir := entry.IsDir()
+	var subThings []os.DirEntry
+	if isDir {
+		var err error
+		subThings, err = os.ReadDir(task)
+		if err != nil {
+			return fmt.Errorf("ReadDir %s: %w", task, err)
+		}
+		job.subThings = subThings
+	}
+
+	select {
+	case r.statEntries <- job:
+	case <-r.statCancel:
+	}
+
+	if isDir {
+		for _, v := range subThings {
+			sInfo, err := v.Info()
+			if err != nil {
+				return fmt.Errorf("getting info of %s/%s: %w", job.task, v.Name(), err)
+			}
+			err = r.rStatWorker(task+"/"+v.Name(), sInfo)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 type driver func(headerBuffer []byte, car *os.File, carOffset int64) error
@@ -527,6 +587,10 @@ type recursiveTraverser struct {
 	tempCarChunk  *os.File
 	tempCarSend   *os.File
 
+	statEntries chan *doJobs
+	statError   chan error
+	statCancel  chan struct{}
+
 	chunkT   chan struct{}
 	sendT    chan sendJobs
 	sendOver chan struct{}
@@ -544,6 +608,12 @@ type recursiveTraverser struct {
 		Cids       map[string]*savedCidsPairs `json:"cids,omitempty"`
 		LastUpdate time.Time                  `json:"lastUpdate,omitempty"`
 	}
+}
+
+type doJobs struct {
+	task      string
+	entry     os.FileInfo
+	subThings []os.DirEntry
 }
 
 type savedCidsPairs struct {
@@ -567,11 +637,17 @@ func (cp *cidSizePair) String() string {
 	return cp.Cid.String() + " fileSize: " + strconv.FormatInt(cp.FileSize, 10) + " dagSize: " + strconv.FormatInt(cp.DagSize, 10)
 }
 
-func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, bool, error) {
-	switch entry.Mode() & os.ModeType {
+func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
+	var job *doJobs
+	select {
+	case job = <-r.statEntries:
+	case err := <-r.statError:
+		return nil, false, err
+	}
+	switch job.entry.Mode() & os.ModeType {
 	case os.ModeSymlink:
-		old, oldExists := r.olds.Cids[task]
-		if oldExists && entry.ModTime().Before(r.olds.LastUpdate) {
+		old, oldExists := r.olds.Cids[job.task]
+		if oldExists && job.entry.ModTime().Before(r.olds.LastUpdate) {
 			// Recover old link
 			c, err := cid.Decode(old.Cid)
 			if err != nil {
@@ -583,9 +659,9 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			}, false, nil
 		}
 
-		target, err := os.Readlink(task)
+		target, err := os.Readlink(job.task)
 		if err != nil {
-			return nil, false, fmt.Errorf("resolving symlink %s: %w", task, err)
+			return nil, false, fmt.Errorf("resolving symlink %s: %w", job.task, err)
 		}
 
 		typ := pb.UnixfsData_Symlink
@@ -595,17 +671,17 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			Data: []byte(target),
 		})
 		if err != nil {
-			return nil, false, fmt.Errorf("marshaling unixfs %s: %w\n", task, err)
+			return nil, false, fmt.Errorf("marshaling unixfs %s: %w\n", job.task, err)
 		}
 
 		data, err = proto.Marshal(&pb.PBNode{Data: data})
 		if err != nil {
-			return nil, false, fmt.Errorf("marshaling ipld %s: %w\n", task, err)
+			return nil, false, fmt.Errorf("marshaling ipld %s: %w\n", job.task, err)
 		}
 
 		hash, err := mh.Encode(data, mh.IDENTITY)
 		if err != nil {
-			return nil, false, fmt.Errorf("inlining %s: %w", task, err)
+			return nil, false, fmt.Errorf("inlining %s: %w", job.task, err)
 		}
 
 		c := cid.NewCidV1(cid.DagProtobuf, hash)
@@ -617,7 +693,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 		}
 		dagSize := int64(len(data))
 		if new {
-			r.olds.Cids[task] = &savedCidsPairs{
+			r.olds.Cids[job.task] = &savedCidsPairs{
 				Cid:     c.String(),
 				DagSize: dagSize,
 			}
@@ -628,24 +704,15 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 		}, new, nil
 
 	case os.ModeDir:
-		old, oldExists := r.olds.Cids[task]
-		new := !oldExists || entry.ModTime().After(r.olds.LastUpdate)
+		old, oldExists := r.olds.Cids[job.task]
+		new := !oldExists || job.entry.ModTime().After(r.olds.LastUpdate)
 
-		subThings, err := os.ReadDir(task)
-		if err != nil {
-			return nil, false, fmt.Errorf("ReadDir %s: %w\n", task, err)
-		}
-
-		links := make([]*pb.PBLink, len(subThings))
+		links := make([]*pb.PBLink, len(job.subThings))
 
 		var dagSum int64
-		sCids := make([]*cidSizePair, len(subThings))
-		for i, v := range subThings {
-			sInfo, err := v.Info()
-			if err != nil {
-				return nil, false, fmt.Errorf("getting info of %s/%s: %w", task, v.Name(), err)
-			}
-			sCid, updated, err := r.do(task+"/"+v.Name(), sInfo)
+		sCids := make([]*cidSizePair, len(job.subThings))
+		for i, v := range job.subThings {
+			sCid, updated, err := r.do()
 			new = new || updated
 			if err != nil {
 				return nil, false, err
@@ -680,17 +747,17 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			Data:  directoryData,
 		})
 		if err != nil {
-			return nil, false, fmt.Errorf("can't Marshal directory %s: %w", task, err)
+			return nil, false, fmt.Errorf("can't Marshal directory %s: %w", job.task, err)
 		}
 		if int64(len(data)) > blockTarget {
-			return nil, false, fmt.Errorf("%s is exceed block limit, TODO: support sharding directories", task)
+			return nil, false, fmt.Errorf("%s is exceed block limit, TODO: support sharding directories", job.task)
 		}
 
 		dagSum += int64(len(data))
 
 		c, _, err := r.writePBNode(data)
 		if err != nil {
-			return nil, false, fmt.Errorf("writing directory %s: %w", task, err)
+			return nil, false, fmt.Errorf("writing directory %s: %w", job.task, err)
 		}
 
 		if oldExists {
@@ -699,7 +766,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			new = true
 		}
 		if new {
-			r.olds.Cids[task] = &savedCidsPairs{
+			r.olds.Cids[job.task] = &savedCidsPairs{
 				Cid:     c.String(),
 				DagSize: dagSum,
 			}
@@ -711,8 +778,8 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 	default:
 		// File
-		old, oldExists := r.olds.Cids[task]
-		if oldExists && entry.ModTime().Before(r.olds.LastUpdate) {
+		old, oldExists := r.olds.Cids[job.task]
+		if oldExists && job.entry.ModTime().Before(r.olds.LastUpdate) {
 			// Recover old link
 			c, err := cid.Decode(old.Cid)
 			if err != nil {
@@ -724,26 +791,26 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			}, false, nil
 		}
 
-		f, err := os.Open(task)
+		f, err := os.Open(job.task)
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to open %s: %w", task, err)
+			return nil, false, fmt.Errorf("failed to open %s: %w", job.task, err)
 		}
 		defer f.Close()
 
 		var c *cidSizePair
 		oldOffset := r.tempCarOffset
-		size := entry.Size()
+		size := job.entry.Size()
 		// This check is really important and doesn't only deal with inlining
 		// This ensures that no zero sized files is chunked (the chunker would fail horribly with thoses)
 		if size <= inlineLimit {
 			data := make([]byte, size)
 			_, err := io.ReadFull(f, data)
 			if err != nil {
-				return nil, false, fmt.Errorf("reading %s: %w", task, err)
+				return nil, false, fmt.Errorf("reading %s: %w", job.task, err)
 			}
 			hash, err := mh.Encode(data, mh.IDENTITY)
 			if err != nil {
-				return nil, false, fmt.Errorf("inlining %s: %w", task, err)
+				return nil, false, fmt.Errorf("inlining %s: %w", job.task, err)
 			}
 			c = &cidSizePair{
 				Cid:      cid.NewCidV1(cid.Raw, hash),
@@ -826,7 +893,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 				if err != nil {
 					return nil, false, err
 				}
-				go r.mkChunk(manager, f, task, &CIDs[i], varuintHeader, int64(blockHeaderSize), workSize, carOffset, fileOffset, uint16(toPad))
+				go r.mkChunk(manager, f, job.task, &CIDs[i], varuintHeader, int64(blockHeaderSize), workSize, carOffset, fileOffset, uint16(toPad))
 				fileOffset += workSize
 			}
 
@@ -861,7 +928,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 						lastRoot, fileSum, err = makeFileRoot(CIDs[:median])
 						if err != nil {
-							return nil, false, fmt.Errorf("building a root for %s: %w", task, err)
+							return nil, false, fmt.Errorf("building a root for %s: %w", job.task, err)
 						}
 						lastAttempt = median
 
@@ -882,7 +949,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 						if low != lastAttempt {
 							lastRoot, fileSum, err = makeFileRoot(CIDs[:low])
 							if err != nil {
-								return nil, false, fmt.Errorf("building a root for %s: %w", task, err)
+								return nil, false, fmt.Errorf("building a root for %s: %w", job.task, err)
 							}
 						}
 					}
@@ -894,7 +961,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 
 					c, swapped, err := r.writePBNode(lastRoot)
 					if err != nil {
-						return nil, false, fmt.Errorf("writing root for %s: %w", task, err)
+						return nil, false, fmt.Errorf("writing root for %s: %w", job.task, err)
 					}
 					if swapped {
 						oldOffset = carMaxSize
@@ -916,7 +983,7 @@ func (r *recursiveTraverser) do(task string, entry os.FileInfo) (*cidSizePair, b
 			new = true
 		}
 		if new {
-			r.olds.Cids[task] = &savedCidsPairs{
+			r.olds.Cids[job.task] = &savedCidsPairs{
 				Cid:     c.Cid.String(),
 				DagSize: c.DagSize,
 			}
