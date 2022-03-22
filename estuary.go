@@ -16,7 +16,7 @@ const (
 var estuaryDriverCreator = driverCreator{
 	factory:    newEstuaryDriver,
 	help:       estuaryHelp,
-	maxCarSize: 32*1024*1024*1024 - 1024*1024*128, // ~32 GiB
+	maxCarSize: 31*1024*1024*1024 + 1024*1024*512, // 31GiB512MiB
 }
 
 func estuaryHelp(out io.Writer) {
