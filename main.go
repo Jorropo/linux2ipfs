@@ -992,7 +992,21 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 				DagSize: c.DagSize,
 			}
 		} else {
-			r.tempCarOffset = oldOffset
+			// Zero (punch actually to free up disk blocks) data we unremove
+			sizeToRemove := oldOffset - r.tempCarOffset
+			if sizeToRemove != 0 {
+				conn, err := r.tempCarChunk.SyscallConn()
+				if err != nil {
+					return nil, false, fmt.Errorf("getting syscallconn for punching for %s: %w", job.task, err)
+				}
+				err = conn.Control(func(fd uintptr) {
+					err = unix.Fallocate(int(fd), unix.FALLOC_FL_KEEP_SIZE|unix.FALLOC_FL_PUNCH_HOLE, r.tempCarOffset, sizeToRemove)
+				})
+				if err != nil {
+					return nil, false, fmt.Errorf("punching hole in %s (off: %d, size: %d): %w", job.task, r.tempCarOffset, sizeToRemove, err)
+				}
+				r.tempCarOffset = oldOffset
+			}
 		}
 		return c, new, nil
 	}
