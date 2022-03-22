@@ -44,7 +44,7 @@ const (
 
 	fakeBlockCIDOverheadLength = rawleafCIDLength
 	fakeBlockOverheadLength    = 2 /* First full length header */ + fakeBlockCIDOverheadLength
-	fakeBlockMinLength         = 1<<7 /* space to fill up the varuint so we don't run into "varuint non minimal" errors */ + 1
+	fakeBlockMinLength         = 1<<7 /* space to fill up the varuint so we don't run into "varuint non minimal" errors */ + (fakeBlockOverheadLength - fakeBlockCIDOverheadLength)
 	fakeBlockMaxValue          = uint(len(precomputedEmptyHashes))
 )
 
