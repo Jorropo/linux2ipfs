@@ -407,7 +407,7 @@ TaskLoop:
 			os.Remove(outName)
 			r.chunkT <- struct{}{}
 			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error creating failed out file "+outName+":"+err.Error())
+			fmt.Fprintln(os.Stderr, "error creating failed out file "+outName+": "+err.Error())
 			talkLock.Unlock()
 			continue
 		}
@@ -417,7 +417,7 @@ TaskLoop:
 			os.Remove(outName)
 			r.chunkT <- struct{}{}
 			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error writing header to failed out file "+outName+":"+err.Error())
+			fmt.Fprintln(os.Stderr, "error writing header to failed out file "+outName+": "+err.Error())
 			talkLock.Unlock()
 			continue
 		}
@@ -427,7 +427,7 @@ TaskLoop:
 			os.Remove(outName)
 			r.chunkT <- struct{}{}
 			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error seeking car to failed out file "+outName+":"+err.Error())
+			fmt.Fprintln(os.Stderr, "error seeking car to failed out file "+outName+": "+err.Error())
 			talkLock.Unlock()
 			continue
 		}
@@ -437,7 +437,7 @@ TaskLoop:
 			os.Remove(outName)
 			r.chunkT <- struct{}{}
 			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error copying buffer to "+outName+":"+err.Error())
+			fmt.Fprintln(os.Stderr, "error copying buffer to "+outName+": "+err.Error())
 			talkLock.Unlock()
 			continue
 		}
