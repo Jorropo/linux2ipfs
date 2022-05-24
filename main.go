@@ -30,7 +30,7 @@ import (
 
 const (
 	defaultBlockTarget     = 1024 * 1024 * 2 // 2 MiB
-	defaultInlineLimit     = 32
+	defaultInlineLimit     = 128
 	tempFileNamePattern    = ".temp.%s.car"
 	defaultIncrementalFile = "old.json"
 	defaultUploadTries     = 3
