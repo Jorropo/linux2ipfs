@@ -358,8 +358,9 @@ type driverCreator struct {
 }
 
 var drivers = map[string]driverCreator{
-	"estuary": estuaryDriverCreator,
-	"car":     carDriverCreator,
+	"estuary":      estuaryDriverCreator,
+	"car":          carDriverCreator,
+	"web3.storage": web3StorageDriverCreator,
 }
 
 func (r *recursiveTraverser) sendWorker() {
