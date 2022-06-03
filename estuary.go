@@ -68,7 +68,7 @@ func (e *estuaryDriver) send(headerBuffer []byte, car *os.File, carOffset int64)
 	}
 
 	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Content-Type", "application/car")
+	req.Header.Set("Content-Type", "application/vnd.ipld.car")
 	req.Header.Set("Authorization", "Bearer "+e.key)
 
 	resp, err := e.client.Do(req)
