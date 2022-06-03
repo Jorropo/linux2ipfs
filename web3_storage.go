@@ -60,6 +60,7 @@ func (e *web3StorageDriver) send(headerBuffer []byte, car *os.File, carOffset in
 		return fmt.Errorf("creating the request failed: %w", err)
 	}
 
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Content-Type", "application/vnd.ipld.car")
 	req.Header.Set("Authorization", "Bearer "+e.key)
 

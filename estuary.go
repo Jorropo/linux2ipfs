@@ -67,6 +67,7 @@ func (e *estuaryDriver) send(headerBuffer []byte, car *os.File, carOffset int64)
 		return fmt.Errorf("creating the request failed: %w", err)
 	}
 
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Content-Type", "application/car")
 	req.Header.Set("Authorization", "Bearer "+e.key)
 
