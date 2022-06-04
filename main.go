@@ -1073,13 +1073,12 @@ func (m *concurrentChunkerManager) handleChunkerChanError(err error) error {
 
 func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.File, task string, cidR **cidSizePair, varuintHeader []byte, blockHeaderSize, workSize, carOffset, fileOffset int64, toPad uint16) {
 	err := func() error {
-		buff := make([]byte, workSize)
-		err := fullReadAt(f, buff, fileOffset)
+		h := sha256.New()
+		_, err := io.Copy(h, io.NewSectionReader(f, fileOffset, workSize))
 		if err != nil {
-			return fmt.Errorf("reading file: %w", err)
+			return fmt.Errorf("hashing data for %s: %w", task, err)
 		}
-		hash := sha256.Sum256(buff)
-		mhash, err := mh.Encode(hash[:], mh.SHA2_256)
+		mhash, err := mh.Encode(h.Sum(nil), mh.SHA2_256)
 		if err != nil {
 			return fmt.Errorf("encoding multihash for %s: %w", task, err)
 		}
