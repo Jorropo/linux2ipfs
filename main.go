@@ -495,7 +495,12 @@ func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error
 			}
 		}
 		{
-			// in case we finished by too big estimation, fix them by reserialising the correct amount
+			// binarysearch round up when it can't find a perfect match
+			// lets round down instead else we are one link too big every time
+			if int64(len(blockData)) > blockTarget {
+				low--
+			}
+			// in case we finished by a wrong estimation, fix them by reserialising the correct amount
 			// also serialise in case there were only 2 links
 			if low != lastAttempt {
 				blockData, err = proto.Marshal(&pb.PBNode{
@@ -953,7 +958,12 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 						}
 					}
 					{
-						// in case we finished by too big estimation, fix them by reserialising the correct amount
+						// binarysearch round up when it can't find a perfect match
+						// lets round down instead else we are one link too big every time
+						if int64(len(lastRoot)) > blockTarget {
+							low--
+						}
+						// in case we finished by a wrong estimation, fix them by reserialising the correct amount
 						// also serialise in case there were only 2 links
 						if low != lastAttempt {
 							lastRoot, fileSum, err = makeFileRoot(CIDs[:low])
