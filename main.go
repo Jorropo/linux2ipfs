@@ -49,7 +49,7 @@ const (
 	fakeBlockMinLength         = 1<<7 /* space to fill up the varuint so we don't run into "varuint non minimal" errors */ + (fakeBlockOverheadLength - fakeBlockCIDOverheadLength)
 	fakeBlockMaxValue          = uint(len(precomputedEmptyHashes))
 
-	userAgent = "linux2ipfs"
+	userAgent = "github.com/Jorropo/linux2ipfs"
 )
 
 var talkLock sync.Mutex
