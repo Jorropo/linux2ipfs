@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	pb "github.com/Jorropo/linux2ipfs/pb"
@@ -205,22 +207,49 @@ func mainRet() int {
 	defer os.Remove(tempFileName)
 	defer tempCarB.Close()
 
+	cancel := make(chan struct{})
+	{
+		var cancelOnce sync.Once
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+		go func() {
+			select {
+			case v := <-sig:
+				talkLock.Lock()
+				fmt.Fprintln(os.Stderr, "quiting caught signal: "+v.String())
+				talkLock.Unlock()
+				cancelOnce.Do(func() { close(cancel) })
+			case <-cancel:
+			}
+		}()
+		defer cancelOnce.Do(func() { close(cancel) })
+	}
+
 	r := &recursiveTraverser{
 		tempCarChunk:           tempCarA,
 		tempCarSend:            tempCarB,
 		tempCarOffset:          carMaxSize,
 		statEntries:            make(chan *doJobs, doJobsBuffer),
 		statError:              make(chan error),
-		statCancel:             make(chan struct{}),
+		cancel:                 cancel,
 		chunkT:                 make(chan struct{}, 1),
 		sendT:                  make(chan sendJobs, 1),
-		sendOver:               make(chan struct{}),
 		concurrentChunkerCount: concurrentChunkers,
 		send:                   driverToUse,
 	}
-	defer r.endStatWorker()
-	go r.statWorker(target)
-	go r.sendWorker()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		r.statWorker(target)
+	}()
+	go func() {
+		defer wg.Done()
+		r.sendWorker()
+	}()
+	defer close(r.sendT)
 	r.chunkT <- struct{}{}
 
 	f, err := os.Open(incrementalFile)
@@ -246,15 +275,11 @@ func mainRet() int {
 
 	c, updated, err := r.do()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
+		if !errors.Is(err, errClosing) {
+			fmt.Fprintln(os.Stderr, "error doing: "+err.Error())
+		}
 		return 1
 	}
-	err = r.swap()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error making last swap: "+err.Error())
-		return 1
-	}
-	close(r.sendT)
 
 	fmt.Fprintln(os.Stdout, c.Cid.String())
 
@@ -282,13 +307,7 @@ func mainRet() int {
 		fmt.Fprintln(os.Stderr, "non-updated")
 	}
 
-	<-r.sendOver
-
 	return 0
-}
-
-func (r *recursiveTraverser) endStatWorker() {
-	close(r.statCancel)
 }
 
 func (r *recursiveTraverser) statWorker(task string) {
@@ -296,7 +315,7 @@ func (r *recursiveTraverser) statWorker(task string) {
 	if err != nil {
 		select {
 		case r.statError <- err:
-		case <-r.statCancel:
+		case <-r.cancel:
 			return
 		}
 	}
@@ -304,7 +323,7 @@ func (r *recursiveTraverser) statWorker(task string) {
 	if err != nil {
 		select {
 		case r.statError <- err:
-		case <-r.statCancel:
+		case <-r.cancel:
 			return
 		}
 	}
@@ -329,8 +348,8 @@ func (r *recursiveTraverser) rStatWorker(task string, entry os.FileInfo) error {
 
 	select {
 	case r.statEntries <- job:
-	case <-r.statCancel:
-		return errors.New("stat canceled")
+	case <-r.cancel:
+		return errClosing
 	}
 
 	if isDir {
@@ -366,7 +385,6 @@ var drivers = map[string]driverCreator{
 }
 
 func (r *recursiveTraverser) sendWorker() {
-	defer close(r.sendOver)
 TaskLoop:
 	for task := range r.sendT {
 		if task.offset == carMaxSize || len(task.roots) == 0 {
@@ -603,11 +621,10 @@ type recursiveTraverser struct {
 
 	statEntries chan *doJobs
 	statError   chan error
-	statCancel  chan struct{}
+	cancel      chan struct{}
 
-	chunkT   chan struct{}
-	sendT    chan sendJobs
-	sendOver chan struct{}
+	chunkT chan struct{}
+	sendT  chan sendJobs
 
 	send driver
 
@@ -654,6 +671,8 @@ func (cp *cidSizePair) String() string {
 func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 	var job *doJobs
 	select {
+	case <-r.cancel:
+		return nil, false, errClosing
 	case job = <-r.statEntries:
 	case err := <-r.statError:
 		return nil, false, err
@@ -1027,8 +1046,14 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 	}
 }
 
+var errClosing = errors.New("shutting down")
+
 func (r *recursiveTraverser) swap() error {
-	<-r.chunkT
+	select {
+	case <-r.cancel:
+		return errClosing
+	case <-r.chunkT:
+	}
 	r.tempCarSend, r.tempCarChunk = r.tempCarChunk, r.tempCarSend
 	r.sendT <- r.pullBlock()
 	err := r.tempCarChunk.Truncate(0)
