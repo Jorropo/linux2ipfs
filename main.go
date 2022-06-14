@@ -137,12 +137,22 @@ func mainRet() int {
 			if carMaxSize == 0 {
 				carMaxSize = driv.maxCarSize
 			} else if carMaxSize > driv.maxCarSize {
-				fmt.Fprintln(os.Stderr, "error car-size cannot be smaller than block-target")
+				fmt.Fprintln(os.Stderr, "error car-size cannot be bigger than driver's maximum")
 				bad = bad || true
 			}
 			if carMaxSize < blockTarget {
 				fmt.Fprintln(os.Stderr, "error car-size cannot be smaller than block-target")
 				bad = bad || true
+			}
+			if !noPad {
+				if carMaxSize < diskAssumedBlockSize*2 {
+					fmt.Fprintln(os.Stderr, "error car-size cannot be smaller than "+strconv.Itoa(diskAssumedBlockSize*2)+" when padding is enabled")
+					bad = bad || true
+				}
+				if blockTarget > (carMaxSize - diskAssumedBlockSize) {
+					fmt.Fprintln(os.Stderr, "error car-size + block-target cannot be bigger than car-size - "+strconv.Itoa(diskAssumedBlockSize)+" when padding is enabled")
+					bad = bad || true
+				}
 			}
 		}
 		if inlineLimit < 0 {
