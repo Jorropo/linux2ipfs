@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,7 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	pb "github.com/Jorropo/linux2ipfs/pb"
 	proto "google.golang.org/protobuf/proto"
@@ -247,9 +245,9 @@ func mainRet() int {
 		sendT:                  make(chan sendJobs, 1),
 		concurrentChunkerCount: concurrentChunkers,
 		send:                   driverToUse,
+		incrementalFile:        incrementalFile,
 	}
 	var wg sync.WaitGroup
-	defer wg.Wait()
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -259,28 +257,14 @@ func mainRet() int {
 		defer wg.Done()
 		r.sendWorker()
 	}()
+	defer wg.Wait()
 	defer close(r.sendT)
 	r.chunkT <- struct{}{}
 
-	f, err := os.Open(incrementalFile)
+	r.olds, err = loadIncremental(incrementalFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+", if you havn't created it do \"echo {} > "+incrementalFile+"\": "+err.Error())
+		fmt.Fprintln(os.Stderr, "error loading incremental file: "+err.Error())
 		return 1
-	}
-	defer f.Close()
-
-	err = json.NewDecoder(f).Decode(&r.olds)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error decoding incremental: "+err.Error())
-		return 1
-	}
-	err = f.Close()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
-		return 1
-	}
-	if r.olds.Cids == nil {
-		r.olds.Cids = map[string]*savedCidsPairs{}
 	}
 
 	c, updated, err := r.do()
@@ -301,24 +285,6 @@ func mainRet() int {
 
 	fmt.Fprintln(os.Stdout, c.Cid.String())
 
-	r.olds.LastUpdate = time.Now()
-	f, err = os.OpenFile(incrementalFile, os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error openning "+incrementalFile+": "+err.Error())
-		return 1
-	}
-	defer f.Close()
-
-	err = json.NewEncoder(f).Encode(&r.olds)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error writing "+incrementalFile+": "+err.Error())
-		return 1
-	}
-	err = f.Close()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error closing incremental: "+err.Error())
-		return 1
-	}
 	if updated {
 		fmt.Fprintln(os.Stderr, "updated")
 	} else {
@@ -430,6 +396,14 @@ TaskLoop:
 				continue
 			}
 			r.chunkT <- struct{}{}
+
+			err = dumpIncremental(r.incrementalFile, &task.cids)
+			if err != nil {
+				talkLock.Lock()
+				fmt.Fprintln(os.Stderr, "error dumping incremental: "+err.Error())
+				talkLock.Unlock()
+			}
+
 			continue TaskLoop
 		}
 
@@ -630,6 +604,7 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, bool, error) {
 type sendJobs struct {
 	roots  []*cidSizePair
 	offset int64
+	cids   incrementalFormat
 }
 
 type recursiveTraverser struct {
@@ -653,10 +628,8 @@ type recursiveTraverser struct {
 	makeFailedOutDir sync.Once
 	failedOutCounter uint32
 
-	olds struct {
-		Cids       map[string]*savedCidsPairs `json:"cids,omitempty"`
-		LastUpdate time.Time                  `json:"lastUpdate,omitempty"`
-	}
+	olds            *incrementalFormat
+	incrementalFile string
 }
 
 type doJobs struct {
@@ -665,13 +638,19 @@ type doJobs struct {
 	subThings []os.DirEntry
 }
 
-type savedCidsPairs struct {
-	Cid     string `json:"cid"`
-	DagSize int64  `json:"dagSize"`
-}
-
 func (r *recursiveTraverser) pullBlock() sendJobs {
-	j := sendJobs{r.toSend, r.tempCarOffset}
+	curCids := make(map[string]*savedCidsPairs, len(r.olds.Cids))
+	for k, v := range r.olds.Cids {
+		curCids[k] = v
+	}
+
+	j := sendJobs{roots: r.toSend,
+		offset: r.tempCarOffset,
+		cids: incrementalFormat{
+			Version: r.olds.Version,
+			Cids:    curCids,
+		},
+	}
 	r.toSend = nil
 	return j
 }
@@ -695,10 +674,11 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 	case err := <-r.statError:
 		return nil, false, err
 	}
+	ctime := job.entry.ModTime()
+	old, oldExists := r.olds.Cids[job.task]
 	switch job.entry.Mode() & os.ModeType {
 	case os.ModeSymlink:
-		old, oldExists := r.olds.Cids[job.task]
-		if oldExists && job.entry.ModTime().Before(r.olds.LastUpdate) {
+		if oldExists && !ctime.After(old.LastUpdate) {
 			// Recover old link
 			c, err := cid.Decode(old.Cid)
 			if err != nil {
@@ -745,8 +725,9 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 		dagSize := int64(len(data))
 		if new {
 			r.olds.Cids[job.task] = &savedCidsPairs{
-				Cid:     c.String(),
-				DagSize: dagSize,
+				Cid:        c.String(),
+				DagSize:    dagSize,
+				LastUpdate: ctime,
 			}
 		}
 		return &cidSizePair{
@@ -755,8 +736,7 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 		}, new, nil
 
 	case os.ModeDir:
-		old, oldExists := r.olds.Cids[job.task]
-		new := !oldExists || job.entry.ModTime().After(r.olds.LastUpdate)
+		new := !oldExists || ctime.After(old.LastUpdate)
 
 		links := make([]*pb.PBLink, len(job.subThings))
 
@@ -818,8 +798,9 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 		}
 		if new {
 			r.olds.Cids[job.task] = &savedCidsPairs{
-				Cid:     c.String(),
-				DagSize: dagSum,
+				Cid:        c.String(),
+				DagSize:    dagSum,
+				LastUpdate: ctime,
 			}
 		}
 		return &cidSizePair{
@@ -829,8 +810,7 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 
 	default:
 		// File
-		old, oldExists := r.olds.Cids[job.task]
-		if oldExists && job.entry.ModTime().Before(r.olds.LastUpdate) {
+		if oldExists && !ctime.After(old.LastUpdate) {
 			// Recover old link
 			c, err := cid.Decode(old.Cid)
 			if err != nil {
@@ -1040,8 +1020,9 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 		}
 		if new {
 			r.olds.Cids[job.task] = &savedCidsPairs{
-				Cid:     c.Cid.String(),
-				DagSize: c.DagSize,
+				Cid:        c.Cid.String(),
+				DagSize:    c.DagSize,
+				LastUpdate: ctime,
 			}
 		} else {
 			// Zero (punch actually to free up disk blocks) data we unremove
