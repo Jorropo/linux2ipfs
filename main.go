@@ -280,6 +280,14 @@ func mainRet() int {
 		}
 		return 1
 	}
+	// swap if there is data remaining in the back buffer
+	if r.tempCarOffset != carMaxSize {
+		err = r.swap()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error making last swap: "+err.Error())
+			return 1
+		}
+	}
 
 	fmt.Fprintln(os.Stdout, c.Cid.String())
 
