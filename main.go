@@ -100,7 +100,7 @@ func mainRet() int {
 		flag.UintVar(&uploadTries, "max-upload-attempt", defaultUploadTries, "Number of time to try to upload the resulting cars.")
 		flag.StringVar(&uploadFailedOut, "failed-outs", defaultUploadFailedOut, "Where to move failed upload car files in case an upload failed too many times.")
 		flag.BoolVar(&noPad, "no-pad", false, "Doesn't pad the data chunks in the output car to "+strconv.FormatUint(diskAssumedBlockSize, 10)+" bytes, make marginally smaller output cars however likely NOT produce reflinked data.")
-		flag.StringVar(&driverTarget, "driver", "estuary", "Driver selector.")
+		flag.StringVar(&driverTarget, "driver", "", "Driver selector.")
 		flag.Parse()
 
 		bad := false
@@ -119,17 +119,22 @@ func mainRet() int {
 			bad = bad || true
 		}
 
-		var ok bool
-		driv, ok := drivers[driversAndOptions[0]]
-		if !ok {
-			fmt.Fprintf(os.Stderr, "error driver: %q not found\n", driverTarget)
+		if driverTarget == "" {
+			fmt.Fprintf(os.Stderr, "error no driver specified, you can see potential drivers with: %q\n\tExample: \n\t\t%s\n", os.Args[0]+" -help", os.Args[0]+" -driver car "+strings.Join(os.Args[1:], " "))
 			bad = bad || true
 		} else {
-			var err error
-			driverToUse, err = driv.factory(driversAndOptions[1])
-			if err != nil {
-				fmt.Fprint(os.Stderr, "error creating driver: "+err.Error()+"\n")
+			var ok bool
+			driv, ok := drivers[driversAndOptions[0]]
+			if !ok {
+				fmt.Fprintf(os.Stderr, "error driver: %q not found\n", driverTarget)
 				bad = bad || true
+			} else {
+				var err error
+				driverToUse, err = driv.factory(driversAndOptions[1])
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "error creating driver: "+err.Error())
+					bad = bad || true
+				}
 			}
 
 			if carMaxSize == 0 {
