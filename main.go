@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	pb "github.com/Jorropo/linux2ipfs/pb"
 	proto "google.golang.org/protobuf/proto"
@@ -90,6 +91,7 @@ func mainRet() int {
 	var target string
 	var concurrentChunkers int64
 	var driverToUse driver
+	var dumpThrottle time.Duration
 	{
 		var driverTarget string
 		flag.Int64Var(&blockTarget, "block-target", defaultBlockTarget, "Maximum size of blocks.")
@@ -101,6 +103,7 @@ func mainRet() int {
 		flag.StringVar(&uploadFailedOut, "failed-outs", defaultUploadFailedOut, "Where to move failed upload car files in case an upload failed too many times.")
 		flag.BoolVar(&noPad, "no-pad", false, "Doesn't pad the data chunks in the output car to "+strconv.FormatUint(diskAssumedBlockSize, 10)+" bytes, make marginally smaller output cars however likely NOT produce reflinked data.")
 		flag.StringVar(&driverTarget, "driver", "", "Driver selector.")
+		flag.DurationVar(&dumpThrottle, "dump-throttle", time.Minute*5, "Throttle how often incremental file can be dumped (it will always force dump once finished).")
 		flag.Parse()
 
 		bad := false
@@ -239,6 +242,25 @@ func mainRet() int {
 		defer cancelOnce.Do(func() { close(cancel) })
 	}
 
+	var dumpThrottleChan <-chan time.Time
+	if dumpThrottle <= 0 {
+		c := make(chan time.Time)
+		go func() {
+			for {
+				select {
+				case <-cancel:
+					return
+				case c <- time.Now():
+				}
+			}
+		}()
+		dumpThrottleChan = c
+	} else {
+		t := time.NewTicker(dumpThrottle)
+		defer t.Stop()
+		dumpThrottleChan = t.C
+	}
+
 	r := &recursiveTraverser{
 		tempCarChunk:           tempCarA,
 		tempCarSend:            tempCarB,
@@ -252,6 +274,8 @@ func mainRet() int {
 		send:                   driverToUse,
 		incrementalFile:        incrementalFile,
 		dumpJobs:               make(chan incrementalFormat),
+		dumpThrottle:           dumpThrottleChan,
+		dumpForceNow:           make(chan struct{}),
 	}
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -263,6 +287,7 @@ func mainRet() int {
 		defer wg.Done()
 		defer close(r.dumpJobs)
 		lastDumped := r.sendWorker()
+		close(r.dumpForceNow)
 		if !lastDumped {
 			r.dumpJobs <- r.olds
 		}
@@ -389,6 +414,11 @@ func (r *recursiveTraverser) dumpWorker() {
 			talkLock.Lock()
 			fmt.Fprintln(os.Stderr, "error dumping incremental: "+err.Error())
 			talkLock.Unlock()
+		}
+		// Throttle
+		select {
+		case <-r.dumpThrottle:
+		case <-r.dumpForceNow:
 		}
 	}
 }
@@ -651,9 +681,12 @@ type recursiveTraverser struct {
 	statError   chan error
 	cancel      chan struct{}
 
-	chunkT   chan struct{}
-	sendT    chan sendJobs
-	dumpJobs chan incrementalFormat
+	chunkT chan struct{}
+	sendT  chan sendJobs
+
+	dumpJobs     chan incrementalFormat
+	dumpThrottle <-chan time.Time
+	dumpForceNow chan struct{}
 
 	send driver
 
