@@ -251,16 +251,25 @@ func mainRet() int {
 		concurrentChunkerCount: concurrentChunkers,
 		send:                   driverToUse,
 		incrementalFile:        incrementalFile,
+		dumpJobs:               make(chan incrementalFormat),
 	}
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		r.statWorker(target)
 	}()
 	go func() {
 		defer wg.Done()
-		r.sendWorker()
+		defer close(r.dumpJobs)
+		lastDumped := r.sendWorker()
+		if !lastDumped {
+			r.dumpJobs <- r.olds
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		r.dumpWorker()
 	}()
 	defer wg.Wait()
 	defer close(r.sendT)
@@ -373,9 +382,21 @@ var drivers = map[string]driverCreator{
 	"web3.storage": web3StorageDriverCreator,
 }
 
-func (r *recursiveTraverser) sendWorker() {
+func (r *recursiveTraverser) dumpWorker() {
+	for task := range r.dumpJobs {
+		err := dumpIncremental(r.incrementalFile, task)
+		if err != nil {
+			talkLock.Lock()
+			fmt.Fprintln(os.Stderr, "error dumping incremental: "+err.Error())
+			talkLock.Unlock()
+		}
+	}
+}
+
+func (r *recursiveTraverser) sendWorker() (lastDumped bool) {
 TaskLoop:
 	for task := range r.sendT {
+		lastDumped = false
 		if task.offset == carMaxSize || len(task.roots) == 0 {
 			// Empty car do nothing.
 			continue
@@ -400,13 +421,13 @@ TaskLoop:
 				talkLock.Unlock()
 				continue
 			}
-			r.chunkT <- struct{}{}
 
-			err = dumpIncremental(r.incrementalFile, &task.cids)
-			if err != nil {
-				talkLock.Lock()
-				fmt.Fprintln(os.Stderr, "error dumping incremental: "+err.Error())
-				talkLock.Unlock()
+			r.chunkT <- struct{}{}
+			// only dump if the dump worker is not busy
+			select {
+			case r.dumpJobs <- task.cids:
+				lastDumped = true
+			default:
 			}
 
 			continue TaskLoop
@@ -459,8 +480,17 @@ TaskLoop:
 			talkLock.Unlock()
 			continue
 		}
+
 		r.chunkT <- struct{}{}
+		// only dump if the dump worker is not busy
+		select {
+		case r.dumpJobs <- task.cids:
+			lastDumped = true
+		default:
+		}
 	}
+
+	return
 }
 
 func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error) {
@@ -621,8 +651,9 @@ type recursiveTraverser struct {
 	statError   chan error
 	cancel      chan struct{}
 
-	chunkT chan struct{}
-	sendT  chan sendJobs
+	chunkT   chan struct{}
+	sendT    chan sendJobs
+	dumpJobs chan incrementalFormat
 
 	send driver
 
@@ -633,7 +664,7 @@ type recursiveTraverser struct {
 	makeFailedOutDir sync.Once
 	failedOutCounter uint32
 
-	olds            *incrementalFormat
+	olds            incrementalFormat
 	incrementalFile string
 }
 

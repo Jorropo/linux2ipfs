@@ -23,7 +23,7 @@ type savedCidsPairs1 struct {
 	LastUpdate time.Time `json:"lastUpdate,omitempty"`
 }
 
-func dumpIncremental(path string, data *incrementalFormat) error {
+func dumpIncremental(path string, data incrementalFormat) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("openning %s: %w", path, err)
@@ -41,21 +41,21 @@ func dumpIncremental(path string, data *incrementalFormat) error {
 	return nil
 }
 
-func loadIncremental(path string) (*incrementalFormat, error) {
+func loadIncremental(path string) (incrementalFormat, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("openning %s, if you havn't created it do \"echo {} > %s\": %w", path, path, err)
+		return incrementalFormat{}, fmt.Errorf("openning %s, if you havn't created it do \"echo {} > %s\": %w", path, path, err)
 	}
 	defer f.Close()
 
-	data := &incrementalFormat1{}
-	err = json.NewDecoder(f).Decode(data)
+	var data incrementalFormat1
+	err = json.NewDecoder(f).Decode(&data)
 	if err != nil {
-		return nil, fmt.Errorf("decoding: %w", err)
+		return incrementalFormat{}, fmt.Errorf("decoding: %w", err)
 	}
 	err = f.Close()
 	if err != nil {
-		return nil, fmt.Errorf("closing: %w", err)
+		return incrementalFormat{}, fmt.Errorf("closing: %w", err)
 	}
 
 	if data.Cids == nil {
@@ -70,13 +70,13 @@ func loadIncremental(path string) (*incrementalFormat, error) {
 		data = incremental0to1(data)
 	case 1:
 	default:
-		return nil, fmt.Errorf("unkown version %d", data.Version)
+		return incrementalFormat{}, fmt.Errorf("unkown version %d", data.Version)
 	}
 
 	return data, nil
 }
 
-func incremental0to1(data *incrementalFormat1) *incrementalFormat1 {
+func incremental0to1(data incrementalFormat1) incrementalFormat1 {
 	data.Version = 1
 	t := data.LastUpdate
 	for _, c := range data.Cids {
