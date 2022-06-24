@@ -235,11 +235,17 @@ func mainRet() int {
 				talkLock.Lock()
 				fmt.Fprintln(os.Stderr, "quiting caught signal: "+v.String())
 				talkLock.Unlock()
-				cancelOnce.Do(func() { close(cancel) })
+				cancelOnce.Do(func() {
+					close(cancel)
+					signal.Stop(sig)
+				})
 			case <-cancel:
 			}
 		}()
-		defer cancelOnce.Do(func() { close(cancel) })
+		defer cancelOnce.Do(func() {
+			close(cancel)
+			signal.Stop(sig)
+		})
 	}
 
 	var dumpThrottleChan <-chan time.Time
