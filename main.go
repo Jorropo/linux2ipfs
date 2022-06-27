@@ -867,6 +867,7 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 
 		var c *cidSizePair
 		oldOffset := r.tempCarOffset
+		oldToSendLen := len(r.toSend)
 		size := job.entry.Size()
 		// This check is really important and doesn't only deal with inlining
 		// This ensures that no zero sized files is chunked (the chunker would fail horribly with thoses)
@@ -939,7 +940,8 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 						return nil, false, fmt.Errorf("swapping: %w", err)
 					}
 					manager.populate()
-					oldOffset = r.tempCarOffset
+					oldOffset = carMaxSize
+					oldToSendLen = 0
 					if !noPad {
 						toPad = (uint64(r.tempCarOffset)%diskAssumedBlockSize + diskAssumedBlockSize - uint64(workSize)%diskAssumedBlockSize) % diskAssumedBlockSize
 						if toPad != 0 && toPad < fakeBlockMinLength {
@@ -1038,6 +1040,7 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 					}
 					if swapped {
 						oldOffset = carMaxSize
+						oldToSendLen = 0
 					}
 					CIDs = CIDs[low:]
 
@@ -1076,6 +1079,7 @@ func (r *recursiveTraverser) do() (*cidSizePair, bool, error) {
 					return nil, false, fmt.Errorf("punching hole in %s (off: %d, size: %d): %w", job.task, r.tempCarOffset, sizeToRemove, err)
 				}
 				r.tempCarOffset = oldOffset
+				r.toSend = r.toSend[:oldToSendLen]
 			}
 		}
 		return c, new, nil
