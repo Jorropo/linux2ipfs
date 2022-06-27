@@ -473,9 +473,7 @@ TaskLoop:
 
 		err = r.fallback.send(header, r.tempCarSend, offset)
 		if err != nil {
-			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error saving failed car: "+err.Error())
-			talkLock.Unlock()
+			panic("error saving failed car: " + err.Error())
 		}
 
 		r.chunkT <- struct{}{}
