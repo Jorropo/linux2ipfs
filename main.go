@@ -282,6 +282,7 @@ func mainRet() int {
 		dumpJobs:               make(chan incrementalFormat),
 		dumpThrottle:           dumpThrottleChan,
 		dumpForceNow:           make(chan struct{}),
+		fallback:               carDriver{pathFormat: uploadFailedOut + "/%d.car"},
 	}
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -474,47 +475,11 @@ TaskLoop:
 			os.Mkdir(uploadFailedOut, 0o775)
 		})
 
-		n := atomic.AddUint32(&r.failedOutCounter, 1)
-		outName := uploadFailedOut + "/" + strconv.FormatUint(uint64(n), 10) + ".car"
-		outF, err := os.OpenFile(outName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		err = r.fallback.send(header, r.tempCarSend, offset)
 		if err != nil {
-			outF.Close()
-			os.Remove(outName)
-			r.chunkT <- struct{}{}
 			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error creating failed out file "+outName+": "+err.Error())
+			fmt.Fprintln(os.Stderr, "error saving failed car: "+err.Error())
 			talkLock.Unlock()
-			continue
-		}
-		err = fullWrite(outF, header)
-		if err != nil {
-			outF.Close()
-			os.Remove(outName)
-			r.chunkT <- struct{}{}
-			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error writing header to failed out file "+outName+": "+err.Error())
-			talkLock.Unlock()
-			continue
-		}
-		_, err = r.tempCarSend.Seek(offset, 0)
-		if err != nil {
-			outF.Close()
-			os.Remove(outName)
-			r.chunkT <- struct{}{}
-			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error seeking car to failed out file "+outName+": "+err.Error())
-			talkLock.Unlock()
-			continue
-		}
-		_, err = outF.ReadFrom(r.tempCarSend)
-		outF.Close()
-		if err != nil {
-			os.Remove(outName)
-			r.chunkT <- struct{}{}
-			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error copying buffer to "+outName+": "+err.Error())
-			talkLock.Unlock()
-			continue
 		}
 
 		r.chunkT <- struct{}{}
@@ -694,7 +659,8 @@ type recursiveTraverser struct {
 	dumpThrottle <-chan time.Time
 	dumpForceNow chan struct{}
 
-	send driver
+	send     driver
+	fallback carDriver
 
 	concurrentChunkerCount int64
 
