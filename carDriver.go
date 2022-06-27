@@ -37,11 +37,6 @@ type carDriver struct {
 }
 
 func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) error {
-	_, err := car.Seek(carOffset, 0)
-	if err != nil {
-		return fmt.Errorf("seeking temp file: %w", err)
-	}
-
 	n := atomic.AddUint32(&c.counter, 1)
 	outName := fmt.Sprintf(c.pathFormat, n)
 	outF, err := os.OpenFile(outName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -51,13 +46,13 @@ func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) err
 		return fmt.Errorf("creating failed out file %q: %w", outName, err)
 	}
 	headerLen := int64(len(headerBuffer))
-	err = fullWrite(outF, headerBuffer)
+	_, err = outF.Write(headerBuffer)
 	if err != nil {
 		outF.Close()
 		os.Remove(outName)
 		return fmt.Errorf("writing header to failed out file %q: %w", outName, err)
 	}
-	_, err = car.Seek(carOffset, 0)
+	_, err = car.Seek(carOffset, io.SeekStart)
 	if err != nil {
 		outF.Close()
 		os.Remove(outName)
@@ -74,12 +69,12 @@ func (c *carDriver) send(headerBuffer []byte, car *os.File, carOffset int64) err
 				padHeader += diskAssumedBlockSize
 			}
 
-			err = fullWrite(outF, createPadBlockHeader(padHeader))
+			_, err = outF.Write(createPadBlockHeader(padHeader))
 			if err != nil {
 				return fmt.Errorf("writing pad block to %q: %w", outName, err)
 			}
 
-			_, err = outF.Seek(headerLen+int64(padHeader), 0)
+			_, err = outF.Seek(headerLen+int64(padHeader), io.SeekStart)
 			if err != nil {
 				return fmt.Errorf("seeking after pad block to %q: %w", outName, err)
 			}

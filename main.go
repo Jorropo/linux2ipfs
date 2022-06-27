@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -629,7 +628,7 @@ func (r *recursiveTraverser) writePBNode(data []byte) (cid.Cid, bool, error) {
 	if err != nil {
 		return cid.Cid{}, false, fmt.Errorf("taking offset: %w", err)
 	}
-	err = fullWriteAt(r.tempCarChunk, rootBlock, off)
+	_, err = r.tempCarChunk.WriteAt(rootBlock, off)
 	if err != nil {
 		return cid.Cid{}, false, fmt.Errorf("writing root's header: %w", err)
 	}
@@ -1164,7 +1163,7 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 			DagSize:  workSize,
 		}
 
-		err = fullWriteAt(r.tempCarChunk, append(varuintHeader, c.Bytes()...), carOffset)
+		_, err = r.tempCarChunk.WriteAt(append(varuintHeader, c.Bytes()...), carOffset)
 		if err != nil {
 			return fmt.Errorf("writing CID + header: %w", err)
 		}
@@ -1183,7 +1182,7 @@ func (r *recursiveTraverser) mkChunk(manager *concurrentChunkerManager, f *os.Fi
 
 			buff := createPadBlockHeader(toPad)
 
-			err = fullWriteAt(r.tempCarChunk, buff, carBlockTarget+workSize)
+			_, err = r.tempCarChunk.WriteAt(buff, carBlockTarget+workSize)
 			if err != nil {
 				return fmt.Errorf("writing padding: %w", err)
 			}
@@ -1264,32 +1263,6 @@ func (r *recursiveTraverser) writeToBackBuffer(read *os.File, roff int64, woff i
 		return fmt.Errorf("getting Control of read: %w", err)
 	}
 	return errr
-}
-
-func fullWrite(w io.Writer, buff []byte) error {
-	toWrite := len(buff)
-	var written int
-	for toWrite != written {
-		n, err := w.Write(buff[written:])
-		if err != nil {
-			return err
-		}
-		written += n
-	}
-	return nil
-}
-
-func fullWriteAt(w io.WriterAt, buff []byte, off int64) error {
-	toWrite := int64(len(buff))
-	var written int64
-	for toWrite != written {
-		n, err := w.WriteAt(buff[written:], off+written)
-		if err != nil {
-			return err
-		}
-		written += int64(n)
-	}
-	return nil
 }
 
 func fullReadAt(w io.ReaderAt, buff []byte, off int64) error {

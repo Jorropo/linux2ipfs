@@ -50,7 +50,7 @@ type web3StorageDriver struct {
 }
 
 func (e *web3StorageDriver) send(headerBuffer []byte, car *os.File, carOffset int64) error {
-	_, err := car.Seek(carOffset, 0)
+	_, err := car.Seek(carOffset, io.SeekStart)
 	if err != nil {
 		return fmt.Errorf("error seeking temp file: %w", err)
 	}
