@@ -443,10 +443,7 @@ TaskLoop:
 		}
 		err = r.tempCarSend.Sync()
 		if err != nil {
-			talkLock.Lock()
-			fmt.Fprintln(os.Stderr, "error syncing temp file: "+err.Error())
-			talkLock.Unlock()
-			continue
+			panic(fmt.Errorf("error syncing temp file: %w", err))
 		}
 		for failed := uint(0); failed != uploadTries; failed++ {
 			attemptCount := strconv.FormatUint(uint64(failed+1), 10) + " / " + strconv.FormatUint(uint64(uploadTries), 10)
