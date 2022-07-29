@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 )
 
 const (
@@ -70,6 +71,7 @@ func (e *estuaryDriver) send(headerBuffer []byte, car *os.File, carOffset int64)
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Content-Type", "application/vnd.ipld.car")
 	req.Header.Set("Authorization", "Bearer "+e.key)
+	req.Header.Set("Content-Length", strconv.FormatUint(uint64(int64(len(headerBuffer))+carMaxSize-carOffset), 10))
 
 	resp, err := e.client.Do(req)
 	if err != nil {
