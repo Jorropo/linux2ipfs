@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 )
 
 const (
@@ -63,6 +64,7 @@ func (e *web3StorageDriver) send(headerBuffer []byte, car *os.File, carOffset in
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Content-Type", "application/vnd.ipld.car")
 	req.Header.Set("Authorization", "Bearer "+e.key)
+	req.Header.Set("Content-Length", strconv.FormatUint(uint64(int64(len(headerBuffer))+carMaxSize-carOffset), 10))
 
 	resp, err := e.client.Do(req)
 	if err != nil {
