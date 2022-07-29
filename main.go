@@ -21,7 +21,6 @@ import (
 
 	cid "github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
-	car "github.com/ipld/go-car"
 	mh "github.com/multiformats/go-multihash"
 
 	"go.uber.org/multierr"
@@ -54,6 +53,15 @@ var talkLock sync.Mutex
 
 // Precomputed value
 var directoryData = []byte{0x08, 0x01}
+
+type carHeader struct {
+	Roots   []cid.Cid
+	Version uint64
+}
+
+func init() {
+	cbor.RegisterCborType(carHeader{})
+}
 
 func init() {
 	flag.Usage = func() {
@@ -585,7 +593,7 @@ func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error
 	if err != nil {
 		return nil, 0, fmt.Errorf("casting CID back from bytes: %w", err)
 	}
-	headerBuffer, err := cbor.DumpObject(&car.CarHeader{
+	headerBuffer, err := cbor.DumpObject(carHeader{
 		Roots:   []cid.Cid{c},
 		Version: 1,
 	})
