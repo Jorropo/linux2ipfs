@@ -498,16 +498,15 @@ TaskLoop:
 
 func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error) {
 	cidsToLink := make([]*pb.PBLink, len(job.roots))
-	var nameCounter uint64
-	for _, v := range job.roots {
+	padSize := len(strconv.FormatUint(uint64(len(job.roots)-1), 32))
+	for i, v := range job.roots {
 		sSize := uint64(v.DagSize)
-		n := strconv.FormatUint(uint64(nameCounter), 32)
-		cidsToLink[nameCounter] = &pb.PBLink{
+		n := zeroPad(strconv.FormatUint(uint64(i), 32), padSize)
+		cidsToLink[i] = &pb.PBLink{
 			Name:  &n,
 			Tsize: &sSize,
 			Hash:  v.Cid.Bytes(),
 		}
-		nameCounter++
 	}
 
 	// Write a linking root if we have multiple roots
@@ -579,13 +578,12 @@ func (r *recursiveTraverser) makeSendPayload(job sendJobs) ([]byte, int64, error
 		}
 		c := cid.NewCidV1(cid.DagProtobuf, mhash)
 		data = append(append(append(varuintHeader, c.Bytes()...), blockData...), data...)
-		n := strconv.FormatUint(uint64(nameCounter), 32)
+		n := "0"
 		cidsToLink[0] = &pb.PBLink{
 			Name:  &n,
 			Tsize: &sSize,
 			Hash:  c.Bytes(),
 		}
-		nameCounter++
 	}
 
 	// Writing CAR header
@@ -1316,4 +1314,11 @@ func makeFileRoot(ins []*cidSizePair) ([]byte, int64, error) {
 		Data:  unixfsBlob,
 	})
 	return data, fileSum, err
+}
+
+func zeroPad(s string, i int) string {
+	for len(s) < i {
+		s = "0" + s
+	}
+	return s
 }
